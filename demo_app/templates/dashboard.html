@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Личный кабинет — Demo Shop{% endblock %}
+{% block content %}
+<h1>Личный кабинет</h1>
+<div class="card">
+  <p>Вы вошли как <strong>{{ username }}</strong>.</p>
+  <br>
+  <a href="/items" class="btn btn-primary">Перейти к товарам</a>
+  <a href="/logout" class="btn btn-danger" style="margin-left:8px">Выйти</a>
+</div>
+{% endblock %}

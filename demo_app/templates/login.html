@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Вход — Demo Shop{% endblock %}
+{% block content %}
+<h1>Вход в систему</h1>
+<div class="card" style="max-width:400px">
+  {% if error %}
+    <div class="alert alert-error">{{ error }}</div>
+  {% endif %}
+  <form method="POST" action="/login">
+    <div style="margin-bottom:16px">
+      <label style="display:block;margin-bottom:6px;font-weight:500">Логин</label>
+      <input name="username" id="username" type="text" placeholder="admin"
+             style="width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:.95rem">
+    </div>
+    <div style="margin-bottom:20px">
+      <label style="display:block;margin-bottom:6px;font-weight:500">Пароль</label>
+      <input name="password" id="password" type="password" placeholder="••••••••"
+             style="width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:.95rem">
+    </div>
+    <button type="submit" class="btn btn-primary" style="width:100%">Войти</button>
+  </form>
+  <p style="margin-top:16px;color:#888;font-size:.85rem">
+    Тестовые данные: admin / password123
+  </p>
+</div>
+{% endblock %}

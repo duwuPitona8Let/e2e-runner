@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}{{ item.name }} — Demo Shop{% endblock %}
+{% block content %}
+<h1>{{ item.name }}</h1>
+<div class="card">
+  <p><strong>Артикул:</strong> {{ item.id }}</p>
+  <p style="margin-top:8px"><strong>Цена:</strong> {{ item.price }} ₽</p>
+  <br>
+  <form method="POST" action="/cart/add/{{ item.id }}" style="display:inline">
+    <button type="submit" class="btn btn-success">В корзину</button>
+  </form>
+  <a href="/items" class="btn btn-primary" style="margin-left:8px">← Назад к товарам</a>
+</div>
+{% endblock %}

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "e2e-runner"
+version = "1.0.0"
+description = "CLI runner for automated E2E testing of web applications"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.7",
+    "playwright>=1.40",
+]
+
+[project.scripts]
+e2e = "e2e_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]

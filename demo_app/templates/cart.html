@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Корзина — Demo Shop{% endblock %}
+{% block content %}
+<h1>Корзина</h1>
+{% if cart_items %}
+<div class="card">
+  <table style="width:100%;border-collapse:collapse">
+    <thead>
+      <tr style="border-bottom:2px solid #eee">
+        <th style="text-align:left;padding:10px 0">Товар</th>
+        <th style="text-align:center;padding:10px">Кол-во</th>
+        <th style="text-align:right;padding:10px">Сумма</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in cart_items %}
+      <tr style="border-bottom:1px solid #f0f0f0">
+        <td style="padding:12px 0">{{ item.name }}</td>
+        <td style="text-align:center;padding:12px">{{ item.qty }}</td>
+        <td style="text-align:right;padding:12px;font-weight:600">{{ item.subtotal }} ₽</td>
+        <td style="text-align:right;padding:12px">
+          <form method="POST" action="/cart/remove/{{ item.id }}" style="margin:0">
+            <button type="submit" class="btn btn-danger btn-sm">Удалить</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <div style="margin-top:20px;display:flex;justify-content:space-between;align-items:center">
+    <form method="POST" action="/cart/clear">
+      <button type="submit" class="btn btn-danger">Очистить корзину</button>
+    </form>
+    <span style="font-size:1.2rem;font-weight:700">Итого: {{ total }} ₽</span>
+  </div>
+</div>
+{% else %}
+<div class="card">
+  <p id="empty-cart-message">Корзина пуста.</p>
+  <br>
+  <a href="/items" class="btn btn-primary">Перейти к товарам</a>
+</div>
+{% endif %}
+{% endblock %}

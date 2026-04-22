@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+*.db
+.DS_Store
+.pytest_cache/
+screenshots/
+*.docx
+*.txt
+report.html
+report.json
+.claude/settings.local.json
