@@ -703,7 +703,7 @@ class E2EApp(App):
 
     #logo {
         text-align: center;
-        color: $accent;
+        color: lime;
         text-style: bold;
         margin-bottom: 1;
     }
