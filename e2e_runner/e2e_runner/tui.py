@@ -11,6 +11,7 @@ from textual.widgets import (
     Button,
     DataTable,
     Digits,
+    DirectoryTree,
     Footer,
     Header,
     Input,
@@ -91,6 +92,53 @@ class WarningModal(ModalScreen):
 
 
 # ─────────────────────────────────────────────────────────────
+#  File browser modal
+# ─────────────────────────────────────────────────────────────
+
+class FileBrowserModal(ModalScreen):
+    BINDINGS = [Binding("escape", "dismiss_modal", "Отмена")]
+
+    def __init__(self, start_path: str) -> None:
+        super().__init__()
+        self._start = Path(start_path).resolve() if Path(start_path).exists() else Path.cwd()
+        self._selected: Path | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Static("📁  Выберите папку с тестами", id="fb-title"),
+            Static(str(self._start), id="fb-current"),
+            DirectoryTree(str(self._start), id="fb-tree"),
+            Horizontal(
+                Button("Выбрать", variant="success", id="fb-ok"),
+                Button("Отмена",  variant="default", id="fb-cancel"),
+                classes="modal-btns",
+            ),
+            id="fb-box",
+        )
+
+    @on(DirectoryTree.DirectorySelected)
+    def dir_selected(self, event: DirectoryTree.DirectorySelected) -> None:
+        self._selected = event.path
+        self.query_one("#fb-current", Static).update(str(event.path))
+
+    @on(DirectoryTree.FileSelected)
+    def file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        self._selected = event.path
+        self.query_one("#fb-current", Static).update(str(event.path))
+
+    @on(Button.Pressed, "#fb-ok")
+    def ok(self) -> None:
+        self.dismiss(str(self._selected) if self._selected else None)
+
+    @on(Button.Pressed, "#fb-cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+
+# ─────────────────────────────────────────────────────────────
 #  Settings screen
 # ─────────────────────────────────────────────────────────────
 
@@ -108,7 +156,11 @@ class SettingsScreen(Screen):
             Static("", id="settings-error"),
 
             Static("Путь к тестам", classes="field-label"),
-            Input(value=self.config.tests_path, id="tests_path", placeholder="tests/"),
+            Horizontal(
+                Input(value=self.config.tests_path, id="tests_path", placeholder="tests/"),
+                Button("📁", id="browse-path", classes="browse-btn"),
+                classes="path-row",
+            ),
             Static("Папка или файл с тестами (test_*.py)", classes="field-hint"),
 
             Static("Base URL", classes="field-label"),
@@ -172,6 +224,16 @@ class SettingsScreen(Screen):
 
     def _clear_error(self) -> None:
         self.query_one("#settings-error", Static).update("")
+
+    @on(Button.Pressed, "#browse-path")
+    async def browse(self) -> None:
+        current = self.query_one("#tests_path", Input).value or "."
+
+        def handle(path: str | None) -> None:
+            if path is not None:
+                self.query_one("#tests_path", Input).value = path
+
+        await self.app.push_screen(FileBrowserModal(current), handle)
 
     @on(Button.Pressed, "#save")
     def save(self) -> None:
@@ -347,6 +409,7 @@ class HistoryDetailScreen(Screen):
     def __init__(self, run_id: int) -> None:
         super().__init__()
         self.run_id = run_id
+        self._results: list[TestResult] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -360,6 +423,11 @@ class HistoryDetailScreen(Screen):
                 id="stats-row",
             ),
             DataTable(id="detail-table"),
+            Static("[dim]Enter — открыть скриншот упавшего теста[/dim]", id="detail-hint"),
+            Horizontal(
+                Button("↓  Экспортировать", variant="primary", id="btn-export"),
+                classes="detail-btns",
+            ),
             id="detail-container",
         )
         yield Footer()
@@ -380,6 +448,8 @@ class HistoryDetailScreen(Screen):
             self.query_one("#dd-errored", Digits).update(str(run["errored"]))
             self.query_one("#dd-total",   Digits).update(str(run["total"]))
 
+        self._results = results
+
         t = self.query_one("#detail-table", DataTable)
         t.add_columns("  Тест", "Статус", "Время", "Ошибка")
         t.cursor_type = "row"
@@ -393,10 +463,89 @@ class HistoryDetailScreen(Screen):
                 f"[dim]{error}[/dim]" if error else "",
             )
 
+    @on(DataTable.RowSelected, "#detail-table")
+    def open_screenshot(self, event: DataTable.RowSelected) -> None:
+        import subprocess, sys
+        idx = event.cursor_row
+        if idx >= len(self._results):
+            return
+        result = self._results[idx]
+        if not result.screenshot_path:
+            self.app.notify("Скриншот недоступен для этого теста", severity="warning")
+            return
+        path = Path(result.screenshot_path)
+        if not path.exists():
+            self.app.notify(f"Файл не найден: {path}", severity="error")
+            return
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        elif sys.platform.startswith("linux"):
+            subprocess.Popen(["xdg-open", str(path)])
+        else:
+            import os
+            os.startfile(str(path))
+        self.app.notify(f"Открываю: {path.name}")
+
+    @on(Button.Pressed, "#btn-export")
+    def btn_export(self) -> None:
+        self._do_export()
+
+    @work(thread=True)
+    def _do_export(self) -> None:
+        from datetime import datetime
+        run_data = _storage.get_run(self.run_id)
+        results  = _storage.get_run_results(self.run_id)
+        if not run_data:
+            self.app.call_from_thread(self.app.notify, "Прогон не найден", severity="error")
+            return
+        test_run = TestRun(
+            id=self.run_id,
+            project_name=run_data["project_name"],
+            started_at=datetime.fromisoformat(run_data["started_at"]),
+            finished_at=datetime.fromisoformat(run_data["finished_at"]) if run_data["finished_at"] else None,
+            results=results,
+        )
+        html_path = Path(f"report_{self.run_id}.html")
+        json_path = Path(f"report_{self.run_id}.json")
+        generate_html_report(test_run, html_path)
+        generate_json_report(test_run, json_path)
+        self.app.call_from_thread(
+            self.app.notify,
+            f"Сохранено: {html_path.resolve()}",
+            severity="information",
+            timeout=6,
+        )
+
 
 # ─────────────────────────────────────────────────────────────
 #  History screen
 # ─────────────────────────────────────────────────────────────
+
+class ConfirmModal(ModalScreen):
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Static("⚠  Подтверждение", id="modal-title"),
+            Static(self._message, id="modal-body"),
+            Horizontal(
+                Button("Удалить", variant="error",   id="modal-ok"),
+                Button("Отмена",  variant="default", id="modal-cancel"),
+                classes="modal-btns",
+            ),
+            id="modal-box",
+        )
+
+    @on(Button.Pressed, "#modal-ok")
+    def ok(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#modal-cancel")
+    def cancel(self) -> None:
+        self.dismiss(False)
+
 
 class HistoryScreen(Screen):
     BINDINGS = [Binding("escape", "app.pop_screen", "Назад")]
@@ -404,14 +553,22 @@ class HistoryScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Vertical(
-            Static("  История запусков  [dim](Enter или двойной клик — открыть детали)[/dim]", id="history-title"),
+            Static("  История запусков  [dim](Enter — открыть детали)[/dim]", id="history-title"),
             DataTable(id="history-table"),
+            Horizontal(
+                Button("🗑  Очистить историю", variant="error", id="btn-clear-history"),
+                classes="detail-btns",
+            ),
             id="history-container",
         )
         yield Footer()
 
     def on_mount(self) -> None:
+        self._reload_table()
+
+    def _reload_table(self) -> None:
         t = self.query_one("#history-table", DataTable)
+        t.clear(columns=True)
         t.add_columns("ID", "Проект", "Дата", "Всего", "✓ Прошло", "✗ Упало", "Время")
         t.cursor_type = "row"
         for r in _storage.list_runs(limit=30):
@@ -432,6 +589,24 @@ class HistoryScreen(Screen):
     def open_detail(self, event: DataTable.RowSelected) -> None:
         run_id = int(event.row_key.value)
         self.app.push_screen(HistoryDetailScreen(run_id))
+
+    @on(Button.Pressed, "#btn-clear-history")
+    def btn_clear(self) -> None:
+        runs = _storage.list_runs(limit=10000)
+        if not runs:
+            self.app.notify("История уже пуста", severity="warning")
+            return
+
+        def handle(confirmed: bool | None) -> None:
+            if confirmed:
+                deleted = _storage.delete_runs()
+                self._reload_table()
+                self.app.notify(f"Удалено прогонов: {deleted}", severity="information")
+
+        self.app.push_screen(
+            ConfirmModal(f"Удалить все {len(runs)} прогонов из истории?"),
+            handle,
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -682,6 +857,19 @@ class E2EApp(App):
     .stat-err  Digits { color: $warning; }
     .stat-total Digits { color: $accent; }
 
+    /* ── Detail hint & export button ── */
+    #detail-hint {
+        color: $text-disabled;
+        padding: 0 0;
+        height: 1;
+    }
+
+    .detail-btns {
+        height: 3;
+        margin-top: 1;
+        align: left middle;
+    }
+
     /* ── History ── */
     #history-title {
         text-style: bold;
@@ -725,6 +913,56 @@ class E2EApp(App):
     }
 
     .modal-btns Button { margin-right: 1; }
+
+    /* ── File browser modal ── */
+    FileBrowserModal {
+        align: center middle;
+    }
+
+    #fb-box {
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+        width: 70;
+        height: 30;
+    }
+
+    #fb-title {
+        text-style: bold;
+        color: $accent;
+        text-align: center;
+        margin-bottom: 1;
+    }
+
+    #fb-current {
+        color: $text-muted;
+        text-style: italic;
+        margin-bottom: 1;
+        padding: 0 1;
+        height: 1;
+        overflow: hidden;
+    }
+
+    #fb-tree {
+        height: 1fr;
+        border: round $primary-darken-2;
+        margin-bottom: 1;
+    }
+
+    /* ── Path row with browse button ── */
+    .path-row {
+        height: auto;
+    }
+
+    .path-row Input {
+        width: 1fr;
+    }
+
+    .browse-btn {
+        width: 5;
+        min-width: 5;
+        margin-left: 1;
+    }
     """
 
     def on_mount(self) -> None:

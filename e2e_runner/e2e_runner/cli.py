@@ -6,6 +6,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from .config import CONFIG_FILENAME, CONFIG_TEMPLATE, find_config, load_config
 from .discovery import discover_tests
 from .models import Project, TestRun
 from .reporter import (
@@ -50,7 +51,18 @@ def _validate_retry(retry: int) -> None:
         raise SystemExit(1)
 
 
-@click.group()
+@click.group(epilog=(
+    "Examples:\n\n\b\n"
+    "  e2e init                              # create e2e.yaml config\n"
+    "  e2e run                               # run using e2e.yaml\n"
+    "  e2e run tests/ -u http://localhost:8080\n"
+    "  e2e run tests/ -u URL -n 4 --retry 2 --fail-fast --html report.html\n"
+    "  e2e export RUN_ID [--format html|json|all] [--open]\n"
+    "  e2e clean [--keep N] [-p PROJECT] [-y]\n"
+    "  e2e history [-p PROJECT] [-n LIMIT]\n"
+    "  e2e report RUN_ID [--html PATH] [--json PATH]\n"
+    "  e2e projects add NAME URL [-d DESCRIPTION]\n"
+))
 @click.version_option("1.0.0", prog_name="e2e")
 def main() -> None:
     """E2E test runner for web applications."""
@@ -61,46 +73,63 @@ def main() -> None:
 # ──────────────────────────────────────────────
 
 @main.command()
-@click.argument("path", type=click.Path(exists=True, path_type=Path), default=".")
-@click.option("-p", "--project", default="default", show_default=True, help="Project name")
-@click.option("-u", "--base-url", default="", help="Base URL injected into tests")
+@click.argument("path", type=click.Path(exists=True, path_type=Path), default=None)
+@click.option("-p", "--project", default=None, help="Project name")
+@click.option("-u", "--base-url", default=None, help="Base URL injected into tests")
 @click.option("-k", "--filter", "filter_pattern", default="", help="Filter tests by name substring")
-@click.option("--headed", is_flag=True, help="Run browser in headed (visible) mode")
-@click.option("-n", "--workers", default=1, show_default=True, help="Parallel workers")
-@click.option("--timeout", default=30000, show_default=True, help="Browser action timeout (ms)")
+@click.option("--headed/--no-headed", default=None, help="Run browser in headed (visible) mode")
+@click.option("-n", "--workers", default=None, type=int, help="Parallel workers")
+@click.option("--timeout", default=None, type=int, help="Browser action timeout (ms)")
 @click.option("--html", "html_report", type=click.Path(path_type=Path), default=None, help="Save HTML report to file")
 @click.option("--json", "json_report", type=click.Path(path_type=Path), default=None, help="Save JSON report to file")
-@click.option("--retry", default=0, show_default=True, help="Retry failed tests N times")
-@click.option("--fail-fast", is_flag=True, help="Stop on first failure")
+@click.option("--retry", default=None, type=int, help="Retry failed tests N times")
+@click.option("--fail-fast/--no-fail-fast", default=None, help="Stop on first failure")
 @click.option("--save/--no-save", default=True, show_default=True, help="Save run to history")
 def run(
-    path: Path,
-    project: str,
-    base_url: str,
+    path: Path | None,
+    project: str | None,
+    base_url: str | None,
     filter_pattern: str,
-    headed: bool,
-    workers: int,
-    timeout: int,
+    headed: bool | None,
+    workers: int | None,
+    timeout: int | None,
     html_report: Path | None,
     json_report: Path | None,
-    retry: int,
-    fail_fast: bool,
+    retry: int | None,
+    fail_fast: bool | None,
     save: bool,
 ) -> None:
     """Discover and run E2E tests in PATH."""
-    _validate_timeout(timeout)
-    _validate_retry(retry)
-    if base_url:
-        _validate_url(base_url, "base-url")
-    project_obj = _storage.get_project(project)
-    effective_url = base_url or (project_obj.base_url if project_obj else "")
+    cfg: dict = {}
+    cfg_path = find_config()
+    if cfg_path:
+        cfg = load_config(cfg_path)
+        console.print(f"[dim]Config: {cfg_path}[/dim]")
 
-    tests = discover_tests(path, filter_pattern)
+    effective_project  = project   or cfg.get("project",   "default")
+    effective_base_url = base_url  or cfg.get("base_url",  "")
+    effective_workers  = workers   if workers  is not None else cfg.get("workers",  1)
+    effective_timeout  = timeout   if timeout  is not None else cfg.get("timeout",  30000)
+    effective_retry    = retry     if retry    is not None else cfg.get("retry",    0)
+    effective_headed   = headed    if headed   is not None else cfg.get("headed",   False)
+    effective_failfast = fail_fast if fail_fast is not None else cfg.get("fail_fast", False)
+    effective_html     = html_report or (Path(cfg["html_report"]) if cfg.get("html_report") else None)
+    effective_json     = json_report or (Path(cfg["json_report"]) if cfg.get("json_report") else None)
+    effective_path     = path or Path(cfg.get("tests", "."))
+
+    _validate_timeout(effective_timeout)
+    _validate_retry(effective_retry)
+    if effective_base_url:
+        _validate_url(effective_base_url, "base-url")
+    project_obj = _storage.get_project(effective_project)
+    effective_url = effective_base_url or (project_obj.base_url if project_obj else "")
+
+    tests = discover_tests(effective_path, filter_pattern)
     if not tests:
         console.print("[yellow]No tests found.[/yellow]")
         raise SystemExit(0)
 
-    console.print(f"\n[bold]Found {len(tests)} test(s)[/bold] in [cyan]{path}[/cyan]\n")
+    console.print(f"\n[bold]Found {len(tests)} test(s)[/bold] in [cyan]{effective_path}[/cyan]\n")
 
     progress = make_progress(len(tests))
     task_id = progress.add_task("Running…", total=len(tests))
@@ -115,13 +144,13 @@ def run(
     with progress:
         test_run = run_suite(
             tests=tests,
-            project_name=project,
+            project_name=effective_project,
             base_url=effective_url,
-            headless=not headed,
-            timeout=timeout,
-            workers=workers,
-            retries=retry,
-            fail_fast=fail_fast,
+            headless=not effective_headed,
+            timeout=effective_timeout,
+            workers=effective_workers,
+            retries=effective_retry,
+            fail_fast=effective_failfast,
             on_result=on_result,
         )
 
@@ -131,15 +160,32 @@ def run(
         _storage.save_run(test_run)
         console.print(f"[dim]Run saved (id={test_run.id})[/dim]")
 
-    if html_report:
-        generate_html_report(test_run, html_report)
-        console.print(f"[dim]HTML report → {html_report}[/dim]")
+    if effective_html:
+        generate_html_report(test_run, effective_html)
+        console.print(f"[dim]HTML report → {effective_html}[/dim]")
 
-    if json_report:
-        generate_json_report(test_run, json_report)
-        console.print(f"[dim]JSON report → {json_report}[/dim]")
+    if effective_json:
+        generate_json_report(test_run, effective_json)
+        console.print(f"[dim]JSON report → {effective_json}[/dim]")
 
     raise SystemExit(0 if test_run.failed == 0 and test_run.errored == 0 else 1)
+
+
+# ──────────────────────────────────────────────
+#  init
+# ──────────────────────────────────────────────
+
+@main.command()
+@click.option("-f", "--force", is_flag=True, help="Overwrite existing e2e.yaml")
+def init(force: bool) -> None:
+    """Create e2e.yaml config file in the current directory."""
+    dest = Path.cwd() / CONFIG_FILENAME
+    if dest.exists() and not force:
+        console.print(f"[yellow]{CONFIG_FILENAME} already exists.[/yellow] Use --force to overwrite.")
+        raise SystemExit(1)
+    dest.write_text(CONFIG_TEMPLATE)
+    console.print(f"[green]Created:[/green] {dest}")
+    console.print("[dim]Edit the file, then run [bold]e2e run[/bold] — flags in e2e.yaml are picked up automatically.[/dim]")
 
 
 # ──────────────────────────────────────────────
@@ -334,3 +380,93 @@ def report(run_id: int, html_path: Path | None, json_path: Path | None) -> None:
     if json_path:
         generate_json_report(test_run, json_path)
         console.print(f"[dim]JSON report → {json_path}[/dim]")
+
+
+# ──────────────────────────────────────────────
+#  clean
+# ──────────────────────────────────────────────
+
+@main.command()
+@click.option("-p", "--project", default=None, help="Delete only runs for this project")
+@click.option("--keep", default=0, show_default=True, help="Keep the last N runs (0 = delete all)")
+@click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
+def clean(project: str | None, keep: int, yes: bool) -> None:
+    """Delete run history from the database.
+
+    By default removes all runs. Use --keep N to retain the most recent N runs.
+    """
+    runs = _storage.list_runs(project_name=project, limit=10000)
+    target = len(runs) - keep if keep > 0 else len(runs)
+    if target <= 0:
+        console.print("[dim]Нечего удалять.[/dim]")
+        return
+
+    scope = f"проекта '{project}'" if project else "всей истории"
+    msg = (
+        f"Будет удалено [bold]{target}[/bold] прогон(ов) из {scope}"
+        + (f" (оставить последние {keep})" if keep else "")
+        + "."
+    )
+    console.print(msg)
+
+    if not yes and not click.confirm("Продолжить?", default=False):
+        console.print("[dim]Отменено.[/dim]")
+        return
+
+    deleted = _storage.delete_runs(project_name=project, keep_last=keep)
+    console.print(f"[green]Удалено прогонов:[/green] {deleted}")
+
+
+# ──────────────────────────────────────────────
+#  export
+# ──────────────────────────────────────────────
+
+@main.command()
+@click.argument("run_id", type=int)
+@click.option(
+    "--format", "fmt",
+    type=click.Choice(["html", "json", "all"]),
+    default="all", show_default=True,
+    help="Which format(s) to export",
+)
+@click.option("--html", "html_path", type=click.Path(path_type=Path), default=None, help="HTML output path (default: report_<id>.html)")
+@click.option("--json", "json_path", type=click.Path(path_type=Path), default=None, help="JSON output path (default: report_<id>.json)")
+@click.option("--open", "open_browser", is_flag=True, help="Open HTML report in browser after export")
+def export(run_id: int, fmt: str, html_path: Path | None, json_path: Path | None, open_browser: bool) -> None:
+    """Export a saved run to HTML and/or JSON files.
+
+    Paths are auto-generated as report_<id>.html / report_<id>.json
+    if not specified explicitly.
+    """
+    run_data = _storage.get_run(run_id)
+    if not run_data:
+        console.print(f"[red]Run #{run_id} not found.[/red]")
+        raise SystemExit(1)
+
+    results = _storage.get_run_results(run_id)
+
+    from datetime import datetime
+    test_run = TestRun(
+        id=run_id,
+        project_name=run_data["project_name"],
+        started_at=datetime.fromisoformat(run_data["started_at"]),
+        finished_at=datetime.fromisoformat(run_data["finished_at"]) if run_data["finished_at"] else None,
+        results=results,
+    )
+
+    exported_html: Path | None = None
+
+    if fmt in ("html", "all"):
+        dest = html_path or Path(f"report_{run_id}.html")
+        generate_html_report(test_run, dest)
+        console.print(f"[green]HTML[/green] → {dest.resolve()}")
+        exported_html = dest
+
+    if fmt in ("json", "all"):
+        dest = json_path or Path(f"report_{run_id}.json")
+        generate_json_report(test_run, dest)
+        console.print(f"[green]JSON[/green] → {dest.resolve()}")
+
+    if open_browser and exported_html:
+        import webbrowser
+        webbrowser.open(exported_html.resolve().as_uri())

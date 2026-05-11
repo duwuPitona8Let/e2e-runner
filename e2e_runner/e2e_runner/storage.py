@@ -208,6 +208,28 @@ class Storage:
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return dict(row) if row else None
 
+    def delete_runs(self, project_name: Optional[str] = None, keep_last: int = 0) -> int:
+        """Delete runs; returns count of deleted rows. Screenshots are NOT removed from disk."""
+        with self._conn() as conn:
+            if keep_last > 0:
+                subquery = (
+                    "SELECT id FROM runs WHERE project_name = ? ORDER BY started_at DESC LIMIT ?"
+                    if project_name else
+                    "SELECT id FROM runs ORDER BY started_at DESC LIMIT ?"
+                )
+                params = (project_name, keep_last) if project_name else (keep_last,)
+                base = "DELETE FROM runs WHERE id NOT IN (" + subquery + ")"
+                if project_name:
+                    base += " AND project_name = ?"
+                    params = params + (project_name,)
+                cur = conn.execute(base, params)
+            else:
+                if project_name:
+                    cur = conn.execute("DELETE FROM runs WHERE project_name = ?", (project_name,))
+                else:
+                    cur = conn.execute("DELETE FROM runs")
+        return cur.rowcount
+
     def project_stats(self, project_name: str) -> dict:
         with self._conn() as conn:
             row = conn.execute(
