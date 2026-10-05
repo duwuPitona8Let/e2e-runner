@@ -24,6 +24,7 @@
 - Автоматическое обнаружение тестов по шаблону `test_*.py`
 - Параллельный запуск тестов (`--workers N`)
 - Повтор упавших тестов (`--retry N`)
+- Фикстуры: setup/teardown-хуки и общий логин на весь прогон (`use_auth`)
 - Запись тестов в браузере без написания кода (`e2e record`)
 - Скриншоты и Playwright trace при падении теста
 - История прогонов в SQLite
@@ -94,6 +95,44 @@ def test_without_browser():
 - Параметры `page` и `base_url` **опциональны** — инструмент сам их передаёт если они указаны в сигнатуре
 - Никаких импортов из `e2e_runner` не требуется
 - `AssertionError` → статус **FAILED**, любое другое исключение → **ERROR**
+
+### Фикстуры
+
+Подготовка и очистка задаются функциями с определёнными именами — тоже без импортов. Параметры `page` и `base_url` во всех хуках необязательны.
+
+| Функция в файле теста | Когда выполняется |
+|---|---|
+| `setup_module(base_url)` | один раз перед первым тестом файла |
+| `teardown_module(base_url)` | один раз после последнего теста файла (и после `--fail-fast`) |
+| `setup_function(page, base_url)` | перед каждым тестом, на его странице |
+| `teardown_function(page, base_url)` | после каждого теста, на его странице |
+
+Ошибка в любом хуке — статус **ERROR** (не FAILED): упал не тест, а подготовка к нему. Если упал `setup_module`, тесты файла не запускаются.
+
+**Общий логин.** Вместо входа в начале каждого теста опишите сценарий входа один раз в `conftest.py` и подключите его в файле теста:
+
+```python
+# tests/conftest.py
+def auth_admin(page, base_url):
+    page.goto(f"{base_url}/login")
+    page.fill("#username", "admin")
+    page.fill("#password", "password123")
+    page.click("button[type=submit]")
+    page.wait_for_url("**/dashboard")
+```
+
+```python
+# tests/test_account.py
+use_auth = "admin"          # все тесты файла стартуют уже залогиненными
+
+def test_dashboard(page, base_url):
+    page.goto(f"{base_url}/dashboard")
+    assert "Личный кабинет" in page.inner_text("h1")
+```
+
+Вход выполняется **один раз за прогон** (в том числе при `-n 4`): cookies и localStorage сохраняются (Playwright `storage_state`) и подставляются в браузерный контекст каждого теста. Тесты остаются изолированными — у каждого свой контекст, просто с готовой сессией. Файлы без `use_auth` стартуют незалогиненными.
+
+`conftest.py` ищется от папки теста вверх до корня тестов; ближайший побеждает, а `auth_<name>` в самом файле теста важнее всех.
 
 ---
 
@@ -295,7 +334,7 @@ python3 app.py          # http://localhost:8080
 e2e run demo_app/tests -u http://localhost:8080
 ```
 
-Демо-приложение содержит 22 теста: 19 проходят, 3 намеренно падают — для демонстрации `--retry` и `--fail-fast`.
+Демо-приложение содержит 25 тестов: 22 проходят, 3 намеренно падают — для демонстрации `--retry` и `--fail-fast`. Тесты в `test_account.py` используют общий логин из `conftest.py` (см. [Фикстуры](#фикстуры)).
 
 Учётные данные: `admin / password123`, `user / qwerty`.
 
@@ -309,6 +348,7 @@ e2e_runner/
 │   ├── cli.py          # точка входа, Click-команды
 │   ├── discovery.py    # поиск и загрузка тестов
 │   ├── runner.py       # выполнение тестов через Playwright
+│   ├── fixtures.py     # setup/teardown-хуки и общий логин (use_auth)
 │   ├── recorder.py     # e2e record: запись тестов через playwright codegen
 │   ├── reporter.py     # вывод в терминал, HTML/JSON отчёты
 │   ├── storage.py      # SQLite хранилище истории
@@ -322,5 +362,7 @@ demo_app/
 ├── app.py              # Flask-приложение
 ├── templates/          # HTML-шаблоны
 └── tests/
+    ├── conftest.py      # общий логин auth_admin
+    ├── test_account.py  # тесты залогиненного пользователя (use_auth = "admin")
     └── test_demo_app.py
 ```

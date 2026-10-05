@@ -25,6 +25,7 @@ class TestCase:
     file_path: str
     function_name: str
     module_name: str = ""
+    conftest_paths: tuple[str, ...] = ()  # conftest.py files that apply to this test, nearest first
 
 
 @dataclass

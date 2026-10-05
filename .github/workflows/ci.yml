@@ -81,7 +81,7 @@ jobs:
         run: python -m pytest -m integration -v
 
       # demo_app/tests has 3 intentionally failing tests, so `e2e run` must exit 1
-      # with exactly 19 passed / 3 failed. Anything else (crash, exit 0, other counts) fails CI.
+      # with exactly 22 passed / 3 failed. Anything else (crash, exit 0, other counts) fails CI.
       - name: Run e2e CLI (expects 3 intentional failures)
         run: |
           set +e

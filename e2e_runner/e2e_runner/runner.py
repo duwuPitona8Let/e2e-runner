@@ -1,22 +1,34 @@
 
-import inspect
 import logging
 import queue
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 from .discovery import get_callable
+from .fixtures import Fixtures, HookError, call_with_fixtures
 from .models import TestCase, TestResult, TestRun, TestStatus
 
 SCREENSHOT_DIR = Path.home() / ".e2e_runner" / "screenshots"
 TRACE_DIR = Path.home() / ".e2e_runner" / "traces"
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _Settings:
+    """Per-run options shared by every test execution."""
+
+    base_url: str
+    timeout: int
+    retries: int
+    trace: bool
+    fixtures: Fixtures
 
 
 def run_suite(
@@ -35,11 +47,16 @@ def run_suite(
     if trace:
         TRACE_DIR.mkdir(parents=True, exist_ok=True)
     run = TestRun(project_name=project_name, started_at=datetime.now())
+    fixtures = Fixtures(tests, base_url, timeout)
+    settings = _Settings(base_url, timeout, retries, trace, fixtures)
 
-    if workers > 1:
-        results = _run_parallel(tests, base_url, headless, timeout, retries, trace, workers, on_result)
-    else:
-        results = list(_run_sequential(tests, base_url, headless, timeout, retries, trace, fail_fast, on_result))
+    try:
+        if workers > 1:
+            results = _run_parallel(tests, settings, headless, workers, on_result)
+        else:
+            results = list(_run_sequential(tests, settings, headless, fail_fast, on_result))
+    finally:
+        fixtures.finish(tests)
 
     run.results = results
     run.finished_at = datetime.now()
@@ -48,11 +65,8 @@ def run_suite(
 
 def _run_sequential(
     tests: list[TestCase],
-    base_url: str,
+    settings: _Settings,
     headless: bool,
-    timeout: int,
-    retries: int,
-    trace: bool,
     fail_fast: bool,
     on_result: Callable | None,
 ) -> Iterator[TestResult]:
@@ -74,7 +88,7 @@ def _run_sequential(
             return
         try:
             yield from _emit(
-                _safe_execute(test, browser, base_url, timeout, retries, trace) for test in tests
+                _safe_execute(test, browser, settings) for test in tests
             )
         finally:
             browser.close()
@@ -82,11 +96,8 @@ def _run_sequential(
 
 def _run_parallel(
     tests: list[TestCase],
-    base_url: str,
+    settings: _Settings,
     headless: bool,
-    timeout: int,
-    retries: int,
-    trace: bool,
     workers: int,
     on_result: Callable | None,
 ) -> list[TestResult]:
@@ -112,7 +123,7 @@ def _run_parallel(
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=headless)
                 try:
-                    _drain(lambda t: _safe_execute(t, browser, base_url, timeout, retries, trace))
+                    _drain(lambda t: _safe_execute(t, browser, settings))
                 finally:
                     browser.close()
         except Exception as exc:
@@ -136,33 +147,29 @@ def _error_result(test: TestCase, message: str) -> TestResult:
     return TestResult(test_case=test, status=TestStatus.ERROR, duration=0.0, error_message=message)
 
 
-def _safe_execute(
-    test: TestCase,
-    browser: Browser,
-    base_url: str,
-    timeout: int,
-    retries: int,
-    trace: bool,
-) -> TestResult:
+def _safe_execute(test: TestCase, browser: Browser, settings: _Settings) -> TestResult:
     """Never raises: an unexpected runner error becomes an ERROR result for this test only."""
     try:
-        return _execute_with_retry(test, browser, base_url, timeout, retries, trace)
+        error, storage_state = settings.fixtures.prepare(test, browser)
+        if error:
+            return _error_result(test, error)
+        return _execute_with_retry(test, browser, settings, storage_state)
     except Exception as exc:
         return _error_result(test, f"Runner error: {type(exc).__name__}: {exc}")
+    finally:
+        settings.fixtures.test_done(test)
 
 
 def _execute_with_retry(
     test: TestCase,
     browser: Browser,
-    base_url: str,
-    timeout: int,
-    retries: int,
-    trace: bool = False,
+    settings: _Settings,
+    storage_state: dict | None = None,
 ) -> TestResult:
-    result = _execute_test(test, browser, base_url, timeout, trace)
+    result = _execute_test(test, browser, settings, storage_state)
     attempt = 1
-    while result.status in (TestStatus.FAILED, TestStatus.ERROR) and attempt <= retries:
-        result = _execute_test(test, browser, base_url, timeout, trace, attempt=attempt)
+    while result.status in (TestStatus.FAILED, TestStatus.ERROR) and attempt <= settings.retries:
+        result = _execute_test(test, browser, settings, storage_state, attempt=attempt)
         attempt += 1
     return result
 
@@ -170,39 +177,53 @@ def _execute_with_retry(
 def _execute_test(
     test: TestCase,
     browser: Browser,
-    base_url: str,
-    timeout: int,
-    trace: bool = False,
+    settings: _Settings,
+    storage_state: dict | None = None,
     attempt: int = 0,
 ) -> TestResult:
     func = get_callable(test)
     if func is None:
         return _error_result(test, "Could not load test function")
 
-    context: BrowserContext = browser.new_context(base_url=base_url or None)
-    context.set_default_timeout(timeout)
-    if trace:
+    context: BrowserContext = browser.new_context(
+        base_url=settings.base_url or None,
+        storage_state=storage_state,
+    )
+    context.set_default_timeout(settings.timeout)
+    if settings.trace:
         context.tracing.start(screenshots=True, snapshots=True, sources=True)
     page: Page = context.new_page()
     screenshot_path: str | None = None
     trace_path: str | None = None
+    status = TestStatus.ERROR
+    error_message: str | None = None
     start = time.perf_counter()
 
     try:
-        _call_test(func, page, base_url)
+        settings.fixtures.setup_function(test, page)
+        call_with_fixtures(func, page=page, base_url=settings.base_url)
         status = TestStatus.PASSED
-        error_message = None
+    except HookError as exc:
+        # A failing setup is not a failing test: report ERROR even for an AssertionError inside it.
+        error_message = str(exc)
+        screenshot_path = _take_screenshot(page, test, attempt)
     except AssertionError as exc:
         status = TestStatus.FAILED
         error_message = str(exc) or "Assertion failed"
         screenshot_path = _take_screenshot(page, test, attempt)
     except Exception as exc:
-        status = TestStatus.ERROR
         error_message = f"{type(exc).__name__}: {exc}"
         screenshot_path = _take_screenshot(page, test, attempt)
     finally:
         duration = time.perf_counter() - start
-        if trace:
+        try:
+            settings.fixtures.teardown_function(test, page)
+        except HookError as exc:
+            if status is TestStatus.PASSED:
+                status, error_message = TestStatus.ERROR, str(exc)
+            else:
+                logger.warning("%s (after the test had already failed)", exc)
+        if settings.trace:
             trace_path = _stop_trace(context, test, attempt, keep=status != TestStatus.PASSED)
         try:
             context.close()
@@ -217,16 +238,6 @@ def _execute_test(
         screenshot_path=screenshot_path,
         trace_path=trace_path,
     )
-
-
-def _call_test(func: Callable, page: Page, base_url: str) -> None:
-    sig = inspect.signature(func)
-    kwargs: dict = {}
-    if "page" in sig.parameters:
-        kwargs["page"] = page
-    if "base_url" in sig.parameters:
-        kwargs["base_url"] = base_url
-    func(**kwargs)
 
 
 def _artifact_name(test: TestCase, attempt: int) -> str:

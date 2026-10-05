@@ -63,9 +63,14 @@ class FakePage:
         Path(path).write_bytes(b"png")
 
 
+# What FakeContext.storage_state() returns: stands in for the cookies an auth_* function sets.
+FAKE_STORAGE_STATE = {"cookies": [{"name": "session", "value": "logged-in"}], "origins": []}
+
+
 class FakeContext:
-    def __init__(self, base_url: str | None) -> None:
+    def __init__(self, base_url: str | None, storage_state: dict | None = None) -> None:
         self.base_url = base_url
+        self.storage_state_in = storage_state
         self.timeout: int | None = None
         self.tracing = FakeTracing()
         self.closed = False
@@ -75,6 +80,9 @@ class FakeContext:
 
     def new_page(self) -> FakePage:
         return FakePage()
+
+    def storage_state(self) -> dict:
+        return FAKE_STORAGE_STATE
 
     def close(self) -> None:
         self.closed = True
@@ -94,8 +102,8 @@ class FakeBrowser:
     def __init__(self, log: PlaywrightLog) -> None:
         self.log = log
 
-    def new_context(self, base_url: str | None = None) -> FakeContext:
-        ctx = FakeContext(base_url)
+    def new_context(self, base_url: str | None = None, storage_state: dict | None = None) -> FakeContext:
+        ctx = FakeContext(base_url, storage_state)
         self.log.contexts.append(ctx)
         return ctx
 
