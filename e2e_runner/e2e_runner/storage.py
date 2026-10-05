@@ -2,7 +2,6 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from .models import Project, TestCase, TestResult, TestRun, TestStatus
 
@@ -39,8 +38,12 @@ CREATE TABLE IF NOT EXISTS test_results (
     duration        REAL    NOT NULL,
     error_message   TEXT,
     screenshot_path TEXT,
+    trace_path      TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_test_results_run_id ON test_results(run_id);
+CREATE INDEX IF NOT EXISTS idx_runs_project_name   ON runs(project_name);
 """
 
 
@@ -67,6 +70,11 @@ class Storage:
     def _init_db(self) -> None:
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            # Migration for databases created before trace support.
+            try:
+                conn.execute("ALTER TABLE test_results ADD COLUMN trace_path TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     # ------------------------------------------------------------------
     # Projects
@@ -81,7 +89,7 @@ class Storage:
             project.id = cur.lastrowid
         return project
 
-    def get_project(self, name: str) -> Optional[Project]:
+    def get_project(self, name: str) -> Project | None:
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
         if row is None:
@@ -113,19 +121,18 @@ class Storage:
             cur = conn.execute("DELETE FROM projects WHERE name = ?", (name,))
         return cur.rowcount > 0
 
-    def update_project(self, name: str, base_url: Optional[str], description: Optional[str]) -> bool:
-        fields, values = [], []
-        if base_url is not None:
-            fields.append("base_url = ?")
-            values.append(base_url)
-        if description is not None:
-            fields.append("description = ?")
-            values.append(description)
+    def update_project(self, name: str, base_url: str | None, description: str | None) -> bool:
+        # Column names come from this fixed mapping, never from user input; values are bound via "?".
+        changes = {"base_url": base_url, "description": description}
+        fields = {col: val for col, val in changes.items() if val is not None}
         if not fields:
             return False
-        values.append(name)
+        assignments = ", ".join(f"{col} = ?" for col in fields)
         with self._conn() as conn:
-            cur = conn.execute(f"UPDATE projects SET {', '.join(fields)} WHERE name = ?", values)
+            cur = conn.execute(
+                f"UPDATE projects SET {assignments} WHERE name = ?",
+                (*fields.values(), name),
+            )
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------
@@ -152,8 +159,9 @@ class Storage:
             for result in run.results:
                 conn.execute(
                     """INSERT INTO test_results
-                       (run_id, test_name, file_path, function_name, status, duration, error_message, screenshot_path)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (run_id, test_name, file_path, function_name, status, duration,
+                        error_message, screenshot_path, trace_path)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         run_id,
                         result.test_case.name,
@@ -163,12 +171,13 @@ class Storage:
                         result.duration,
                         result.error_message,
                         result.screenshot_path,
+                        result.trace_path,
                     ),
                 )
             run.id = run_id
         return run
 
-    def list_runs(self, project_name: Optional[str] = None, limit: int = 20) -> list[dict]:
+    def list_runs(self, project_name: str | None = None, limit: int = 20) -> list[dict]:
         query = "SELECT * FROM runs"
         params: list = []
         if project_name:
@@ -199,16 +208,17 @@ class Storage:
                     duration=r["duration"],
                     error_message=r["error_message"],
                     screenshot_path=r["screenshot_path"],
+                    trace_path=r["trace_path"],
                 )
             )
         return results
 
-    def get_run(self, run_id: int) -> Optional[dict]:
+    def get_run(self, run_id: int) -> dict | None:
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return dict(row) if row else None
 
-    def delete_runs(self, project_name: Optional[str] = None, keep_last: int = 0) -> int:
+    def delete_runs(self, project_name: str | None = None, keep_last: int = 0) -> int:
         """Delete runs; returns count of deleted rows. Screenshots are NOT removed from disk."""
         with self._conn() as conn:
             if keep_last > 0:
