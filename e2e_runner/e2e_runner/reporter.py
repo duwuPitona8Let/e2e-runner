@@ -1,10 +1,15 @@
-from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
-from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
@@ -82,23 +87,25 @@ def print_summary(run: TestRun) -> None:
 
 
 def generate_html_report(run: TestRun, output_path: Path) -> None:
-    rows = ""
+    rows_parts: list[str] = []
     for r in run.results:
         label, _ = STATUS_STYLE[r.status]
         css = {"PASS": "pass", "FAIL": "fail", "ERROR": "error", "SKIP": "skip"}[label]
         error_html = f"<pre>{_esc(r.error_message)}</pre>" if r.error_message else ""
-        screenshot_html = (
-            f'<br><a href="{r.screenshot_path}" target="_blank">screenshot</a>'
-            if r.screenshot_path
-            else ""
-        )
-        rows += f"""
+        links = [
+            f'<a href="{_esc(_file_uri(path))}" target="_blank">{name}</a>'
+            for name, path in (("screenshot", r.screenshot_path), ("trace", r.trace_path))
+            if path
+        ]
+        screenshot_html = "<br>" + " · ".join(links) if links else ""
+        rows_parts.append(f"""
         <tr class="{css}">
           <td>{_esc(r.test_case.name)}</td>
           <td class="badge {css}">{label}</td>
           <td>{r.duration:.2f}s</td>
           <td>{error_html}{screenshot_html}</td>
-        </tr>"""
+        </tr>""")
+    rows = "".join(rows_parts)
 
     verdict = "PASSED" if run.failed == 0 and run.errored == 0 else "FAILED"
     verdict_css = "pass" if verdict == "PASSED" else "fail"
@@ -188,11 +195,17 @@ def generate_json_report(run: TestRun, output_path: Path) -> None:
                 "duration": round(r.duration, 4),
                 "error": r.error_message,
                 "screenshot": r.screenshot_path,
+                "trace": r.trace_path,
             }
             for r in run.results
         ],
     }
     output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _file_uri(path: str) -> str:
+    """Absolute file:// URI so links work no matter where the report is saved."""
+    return Path(path).resolve().as_uri()
 
 
 def _esc(s: str | None) -> str:

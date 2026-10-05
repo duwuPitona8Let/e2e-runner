@@ -1,25 +1,46 @@
 import importlib.util
 import inspect
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
+from types import ModuleType
 
 from .models import TestCase
 
 
-def discover_tests(path: Path, filter_pattern: str = "") -> list[TestCase]:
-    """Recursively find all test_* functions in test_*.py files."""
+class DiscoveryError(Exception):
+    """A test file could not be imported (SyntaxError, ImportError, ...)."""
+
+    def __init__(self, file: Path, cause: BaseException) -> None:
+        super().__init__(f"{file}: {type(cause).__name__}: {cause}")
+        self.file = file
+        self.cause = cause
+
+
+def discover_tests(
+    path: Path,
+    filter_pattern: str = "",
+    errors: list[DiscoveryError] | None = None,
+) -> list[TestCase]:
+    """Recursively find all test_* functions in test_*.py files.
+
+    Files that fail to import are skipped; pass ``errors`` to collect them.
+    """
     test_files = sorted(path.rglob("test_*.py")) if path.is_dir() else [path]
     tests: list[TestCase] = []
     for file in test_files:
-        tests.extend(_collect_from_file(file, filter_pattern))
+        try:
+            module = _load_module(file)
+        except DiscoveryError as exc:
+            if errors is not None:
+                errors.append(exc)
+            continue
+        if module is not None:
+            tests.extend(_collect_from_module(module, file, filter_pattern))
     return tests
 
 
-def _collect_from_file(file: Path, filter_pattern: str) -> list[TestCase]:
-    module = _load_module(file)
-    if module is None:
-        return []
+def _collect_from_module(module: ModuleType, file: Path, filter_pattern: str) -> list[TestCase]:
 
     tests: list[TestCase] = []
     for name, obj in inspect.getmembers(module, inspect.isfunction):
@@ -38,7 +59,8 @@ def _collect_from_file(file: Path, filter_pattern: str) -> list[TestCase]:
     return tests
 
 
-def _load_module(file: Path):
+def _load_module(file: Path) -> ModuleType | None:
+    """Import a test file under a synthetic module name. Raises DiscoveryError on failure."""
     module_name = f"_e2e_discovered.{file.stem}_{abs(hash(str(file)))}"
     spec = importlib.util.spec_from_file_location(module_name, file)
     if spec is None or spec.loader is None:
@@ -48,21 +70,19 @@ def _load_module(file: Path):
     try:
         spec.loader.exec_module(module)
     except Exception as exc:
-        from rich.console import Console
-        Console(stderr=True).print(f"[yellow]Warning:[/yellow] could not import {file}: {exc}")
-        return None
+        # Do not leave a half-initialised module behind for get_callable() to pick up.
+        sys.modules.pop(module_name, None)
+        raise DiscoveryError(file, exc) from exc
     return module
 
 
 def get_callable(test_case: TestCase) -> Callable | None:
-    module_name = next(
-        (k for k in sys.modules if k.endswith(f".{test_case.file_path.replace('/', '_')}")),
-        None,
-    )
-    if module_name is None:
-        module = _load_module(Path(test_case.file_path))
-    else:
-        module = sys.modules[module_name]
+    module = sys.modules.get(test_case.module_name)
+    if module is None:
+        try:
+            module = _load_module(Path(test_case.file_path))
+        except DiscoveryError:
+            return None
     if module is None:
         return None
     return getattr(module, test_case.function_name, None)

@@ -2,13 +2,18 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import click
-from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from .config import CONFIG_FILENAME, CONFIG_TEMPLATE, find_config, load_config
-from .discovery import discover_tests
-from .models import Project, TestRun
+from .config import (
+    CONFIG_FILENAME,
+    CONFIG_TEMPLATE,
+    ConfigError,
+    find_config,
+    load_config,
+)
+from .discovery import DiscoveryError, discover_tests
+from .models import Project, TestResult, TestRun
 from .reporter import (
     console,
     generate_html_report,
@@ -20,7 +25,14 @@ from .reporter import (
 from .runner import run_suite
 from .storage import Storage
 
-_storage = Storage()
+_storage: Storage | None = None
+
+
+def _get_storage() -> Storage:
+    global _storage
+    if _storage is None:
+        _storage = Storage()
+    return _storage
 
 
 def _validate_url(url: str, param_name: str = "URL") -> None:
@@ -49,6 +61,20 @@ def _validate_retry(retry: int) -> None:
     if retry < 0 or retry > 10:
         console.print("[red]Retry count must be between 0 and 10.[/red]")
         raise SystemExit(1)
+
+
+MAX_WORKERS = 32
+
+
+def _validate_workers(workers: int) -> None:
+    if workers < 1 or workers > MAX_WORKERS:
+        console.print(f"[red]Workers must be between 1 and {MAX_WORKERS}.[/red]")
+        raise SystemExit(1)
+
+
+def _print_discovery_errors(errors: list[DiscoveryError]) -> None:
+    for err in errors:
+        console.print(f"[red]Import error:[/red] {err}")
 
 
 @click.group(epilog=(
@@ -84,6 +110,7 @@ def main() -> None:
 @click.option("--json", "json_report", type=click.Path(path_type=Path), default=None, help="Save JSON report to file")
 @click.option("--retry", default=None, type=int, help="Retry failed tests N times")
 @click.option("--fail-fast/--no-fail-fast", default=None, help="Stop on first failure")
+@click.option("--trace/--no-trace", default=None, help="Save Playwright trace (.zip) for failed tests")
 @click.option("--save/--no-save", default=True, show_default=True, help="Save run to history")
 def run(
     path: Path | None,
@@ -97,13 +124,18 @@ def run(
     json_report: Path | None,
     retry: int | None,
     fail_fast: bool | None,
+    trace: bool | None,
     save: bool,
 ) -> None:
     """Discover and run E2E tests in PATH."""
     cfg: dict = {}
     cfg_path = find_config()
     if cfg_path:
-        cfg = load_config(cfg_path)
+        try:
+            cfg = load_config(cfg_path)
+        except ConfigError as exc:
+            console.print(f"[red]Config error:[/red] {exc}")
+            raise SystemExit(1) from None
         console.print(f"[dim]Config: {cfg_path}[/dim]")
 
     effective_project  = project   or cfg.get("project",   "default")
@@ -113,31 +145,33 @@ def run(
     effective_retry    = retry     if retry    is not None else cfg.get("retry",    0)
     effective_headed   = headed    if headed   is not None else cfg.get("headed",   False)
     effective_failfast = fail_fast if fail_fast is not None else cfg.get("fail_fast", False)
+    effective_trace    = trace     if trace    is not None else cfg.get("trace",    False)
     effective_html     = html_report or (Path(cfg["html_report"]) if cfg.get("html_report") else None)
     effective_json     = json_report or (Path(cfg["json_report"]) if cfg.get("json_report") else None)
     effective_path     = path or Path(cfg.get("tests", "."))
 
     _validate_timeout(effective_timeout)
     _validate_retry(effective_retry)
+    _validate_workers(effective_workers)
     if effective_base_url:
         _validate_url(effective_base_url, "base-url")
-    project_obj = _storage.get_project(effective_project)
+    project_obj = _get_storage().get_project(effective_project)
     effective_url = effective_base_url or (project_obj.base_url if project_obj else "")
 
-    tests = discover_tests(effective_path, filter_pattern)
+    import_errors: list[DiscoveryError] = []
+    tests = discover_tests(effective_path, filter_pattern, errors=import_errors)
+    _print_discovery_errors(import_errors)
     if not tests:
+        # An empty suite is a failure: in CI a broken or mistyped path must not look green.
         console.print("[yellow]No tests found.[/yellow]")
-        raise SystemExit(0)
+        raise SystemExit(1)
 
     console.print(f"\n[bold]Found {len(tests)} test(s)[/bold] in [cyan]{effective_path}[/cyan]\n")
 
     progress = make_progress(len(tests))
     task_id = progress.add_task("Running…", total=len(tests))
 
-    completed_results = []
-
-    def on_result(result):
-        completed_results.append(result)
+    def on_result(result: TestResult) -> None:
         print_result_line(result)
         progress.advance(task_id)
 
@@ -151,13 +185,16 @@ def run(
             workers=effective_workers,
             retries=effective_retry,
             fail_fast=effective_failfast,
+            trace=effective_trace,
             on_result=on_result,
         )
 
     print_summary(test_run)
+    if import_errors:
+        console.print(f"[red]{len(import_errors)} test file(s) could not be imported — see errors above.[/red]")
 
     if save:
-        _storage.save_run(test_run)
+        _get_storage().save_run(test_run)
         console.print(f"[dim]Run saved (id={test_run.id})[/dim]")
 
     if effective_html:
@@ -168,7 +205,8 @@ def run(
         generate_json_report(test_run, effective_json)
         console.print(f"[dim]JSON report → {effective_json}[/dim]")
 
-    raise SystemExit(0 if test_run.failed == 0 and test_run.errored == 0 else 1)
+    ok = test_run.failed == 0 and test_run.errored == 0 and not import_errors
+    raise SystemExit(0 if ok else 1)
 
 
 # ──────────────────────────────────────────────
@@ -204,10 +242,12 @@ def ui() -> None:
 @click.option("-k", "--filter", "filter_pattern", default="", help="Filter by name substring")
 def discover(path: Path, filter_pattern: str) -> None:
     """List all tests found in PATH without running them."""
-    tests = discover_tests(path, filter_pattern)
+    import_errors: list[DiscoveryError] = []
+    tests = discover_tests(path, filter_pattern, errors=import_errors)
+    _print_discovery_errors(import_errors)
     if not tests:
         console.print("[yellow]No tests found.[/yellow]")
-        return
+        raise SystemExit(1 if import_errors else 0)
 
     table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
     table.add_column("#", style="dim", justify="right")
@@ -238,17 +278,17 @@ def projects_add(name: str, base_url: str, description: str) -> None:
     """Register a new project."""
     _validate_name(name)
     _validate_url(base_url)
-    if _storage.get_project(name):
+    if _get_storage().get_project(name):
         console.print(f"[red]Project '{name}' already exists.[/red]")
         raise SystemExit(1)
-    project = _storage.add_project(Project(name=name, base_url=base_url, description=description))
+    project = _get_storage().add_project(Project(name=name, base_url=base_url, description=description))
     console.print(f"[green]Project added:[/green] {project.name} → {project.base_url}")
 
 
 @projects.command("list")
 def projects_list() -> None:
     """Show all registered projects."""
-    items = _storage.list_projects()
+    items = _get_storage().list_projects()
     if not items:
         console.print("[dim]No projects registered. Use: e2e projects add NAME URL[/dim]")
         return
@@ -270,7 +310,7 @@ def projects_list() -> None:
 @click.argument("name")
 def projects_remove(name: str) -> None:
     """Delete a project by name."""
-    if not _storage.remove_project(name):
+    if not _get_storage().remove_project(name):
         console.print(f"[red]Project '{name}' not found.[/red]")
         raise SystemExit(1)
     console.print(f"[green]Removed:[/green] {name}")
@@ -284,7 +324,7 @@ def projects_edit(name: str, base_url: str | None, description: str | None) -> N
     """Update project URL or description."""
     if base_url:
         _validate_url(base_url)
-    if not _storage.update_project(name, base_url, description):
+    if not _get_storage().update_project(name, base_url, description):
         console.print(f"[red]Project '{name}' not found or nothing to update.[/red]")
         raise SystemExit(1)
     console.print(f"[green]Updated:[/green] {name}")
@@ -294,7 +334,7 @@ def projects_edit(name: str, base_url: str | None, description: str | None) -> N
 @click.argument("name")
 def projects_stats(name: str) -> None:
     """Show run statistics for a project."""
-    stats = _storage.project_stats(name)
+    stats = _get_storage().project_stats(name)
     if not stats or stats.get("total_runs") == 0:
         console.print(f"[dim]No runs recorded for project '{name}'.[/dim]")
         return
@@ -316,7 +356,7 @@ def projects_stats(name: str) -> None:
 @click.option("-n", "--limit", default=20, show_default=True)
 def history(project: str | None, limit: int) -> None:
     """Show recent test runs."""
-    runs = _storage.list_runs(project_name=project, limit=limit)
+    runs = _get_storage().list_runs(project_name=project, limit=limit)
     if not runs:
         console.print("[dim]No runs in history.[/dim]")
         return
@@ -355,12 +395,12 @@ def history(project: str | None, limit: int) -> None:
 @click.option("--json", "json_path", type=click.Path(path_type=Path), default=None)
 def report(run_id: int, html_path: Path | None, json_path: Path | None) -> None:
     """Show or export details for a specific run."""
-    run_data = _storage.get_run(run_id)
+    run_data = _get_storage().get_run(run_id)
     if not run_data:
         console.print(f"[red]Run #{run_id} not found.[/red]")
         raise SystemExit(1)
 
-    results = _storage.get_run_results(run_id)
+    results = _get_storage().get_run_results(run_id)
 
     from datetime import datetime
     test_run = TestRun(
@@ -395,7 +435,7 @@ def clean(project: str | None, keep: int, yes: bool) -> None:
 
     By default removes all runs. Use --keep N to retain the most recent N runs.
     """
-    runs = _storage.list_runs(project_name=project, limit=10000)
+    runs = _get_storage().list_runs(project_name=project, limit=10000)
     target = len(runs) - keep if keep > 0 else len(runs)
     if target <= 0:
         console.print("[dim]Нечего удалять.[/dim]")
@@ -413,7 +453,7 @@ def clean(project: str | None, keep: int, yes: bool) -> None:
         console.print("[dim]Отменено.[/dim]")
         return
 
-    deleted = _storage.delete_runs(project_name=project, keep_last=keep)
+    deleted = _get_storage().delete_runs(project_name=project, keep_last=keep)
     console.print(f"[green]Удалено прогонов:[/green] {deleted}")
 
 
@@ -438,12 +478,12 @@ def export(run_id: int, fmt: str, html_path: Path | None, json_path: Path | None
     Paths are auto-generated as report_<id>.html / report_<id>.json
     if not specified explicitly.
     """
-    run_data = _storage.get_run(run_id)
+    run_data = _get_storage().get_run(run_id)
     if not run_data:
         console.print(f"[red]Run #{run_id} not found.[/red]")
         raise SystemExit(1)
 
-    results = _storage.get_run_results(run_id)
+    results = _get_storage().get_run_results(run_id)
 
     from datetime import datetime
     test_run = TestRun(

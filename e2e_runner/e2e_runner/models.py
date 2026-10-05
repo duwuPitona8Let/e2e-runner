@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
 
 
 class TestStatus(str, Enum):
@@ -16,8 +15,8 @@ class Project:
     name: str
     base_url: str
     description: str = ""
-    id: Optional[int] = None
-    created_at: Optional[datetime] = None
+    id: int | None = None
+    created_at: datetime | None = None
 
 
 @dataclass
@@ -33,8 +32,9 @@ class TestResult:
     test_case: TestCase
     status: TestStatus
     duration: float
-    error_message: Optional[str] = None
-    screenshot_path: Optional[str] = None
+    error_message: str | None = None
+    screenshot_path: str | None = None
+    trace_path: str | None = None
 
 
 @dataclass
@@ -42,8 +42,8 @@ class TestRun:
     project_name: str
     started_at: datetime
     results: list[TestResult] = field(default_factory=list)
-    finished_at: Optional[datetime] = None
-    id: Optional[int] = None
+    finished_at: datetime | None = None
+    id: int | None = None
 
     @property
     def total(self) -> int:

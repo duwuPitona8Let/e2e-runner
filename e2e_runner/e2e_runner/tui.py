@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
+from typing import ClassVar
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -15,19 +20,25 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
-    Label,
     ProgressBar,
     Static,
     Switch,
 )
 
-from .discovery import discover_tests
+from .discovery import DiscoveryError, discover_tests
 from .models import TestResult, TestRun, TestStatus
 from .reporter import generate_html_report, generate_json_report
 from .runner import run_suite
 from .storage import Storage
 
-_storage = Storage()
+_storage: Storage | None = None
+
+
+def _get_storage() -> Storage:
+    global _storage
+    if _storage is None:
+        _storage = Storage()
+    return _storage
 
 LOGO = """
  ███████╗██████╗ ███████╗
@@ -56,6 +67,7 @@ class Config:
         self.retry       = 0
         self.fail_fast   = False
         self.headed      = False
+        self.trace       = False
         self.html_report = ""
         self.json_report = ""
 
@@ -96,7 +108,7 @@ class WarningModal(ModalScreen):
 # ─────────────────────────────────────────────────────────────
 
 class FileBrowserModal(ModalScreen):
-    BINDINGS = [Binding("escape", "dismiss_modal", "Отмена")]
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "dismiss_modal", "Отмена")]
 
     def __init__(self, start_path: str) -> None:
         super().__init__()
@@ -143,7 +155,7 @@ class FileBrowserModal(ModalScreen):
 # ─────────────────────────────────────────────────────────────
 
 class SettingsScreen(Screen):
-    BINDINGS = [Binding("escape", "app.pop_screen", "Назад")]
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "app.pop_screen", "Назад")]
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -199,6 +211,12 @@ class SettingsScreen(Screen):
                     Static("Показывать окно браузера во время теста", classes="switch-hint"),
                     classes="switch-card",
                 ),
+                Container(
+                    Static("🧭 Trace", classes="switch-label"),
+                    Switch(value=self.config.trace, id="trace"),
+                    Static("Сохранять Playwright trace (.zip) для упавших тестов", classes="switch-hint"),
+                    classes="switch-card",
+                ),
                 classes="switches-row",
             ),
 
@@ -243,16 +261,16 @@ class SettingsScreen(Screen):
         self._clear_error()
 
         base_url = val("base_url")
-        if base_url and not (base_url.startswith("http://") or base_url.startswith("https://")):
+        if base_url and not base_url.startswith(("http://", "https://")):
             self._show_error("Base URL должен начинаться с http:// или https://")
             return
 
         try:
             workers = int(val("workers") or "1")
-            if workers < 1:
+            if not (1 <= workers <= 32):
                 raise ValueError
         except ValueError:
-            self._show_error("Параллельные потоки: введите целое число ≥ 1")
+            self._show_error("Параллельные потоки: введите целое число от 1 до 32")
             return
 
         try:
@@ -265,10 +283,10 @@ class SettingsScreen(Screen):
 
         try:
             retry = int(val("retry") or "0")
-            if retry < 0:
+            if not (0 <= retry <= 10):
                 raise ValueError
         except ValueError:
-            self._show_error("Retry: введите целое число ≥ 0")
+            self._show_error("Retry: введите целое число от 0 до 10")
             return
 
         self.config.tests_path  = val("tests_path") or "."
@@ -280,6 +298,7 @@ class SettingsScreen(Screen):
         self.config.retry       = retry
         self.config.fail_fast   = self.query_one("#fail_fast", Switch).value
         self.config.headed      = self.query_one("#headed",    Switch).value
+        self.config.trace       = self.query_one("#trace",     Switch).value
         self.app.pop_screen()
 
     @on(Button.Pressed, "#cancel")
@@ -292,13 +311,16 @@ class SettingsScreen(Screen):
 # ─────────────────────────────────────────────────────────────
 
 class ResultsScreen(Screen):
-    BINDINGS = [Binding("escape", "app.pop_screen", "Назад")]
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "app.pop_screen", "Назад")]
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.config  = config
-        self._total  = 0
+        self.config   = config
+        self._total   = 0
         self._run: TestRun | None = None
+        self._passed  = 0
+        self._failed  = 0
+        self._errored = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -325,8 +347,24 @@ class ResultsScreen(Screen):
 
     @work(thread=True)
     def run_tests(self) -> None:
-        path  = Path(self.config.tests_path)
-        tests = discover_tests(path)
+        try:
+            self._run_tests()
+        except Exception as exc:
+            # Without this a failure (e.g. Playwright not installed) would crash the whole TUI.
+            message = f"{type(exc).__name__}: {exc}"
+            self.app.call_from_thread(self._set_status, f"[bold red]Ошибка запуска:[/bold red] {message}")
+            self.app.call_from_thread(self.app.notify, message, severity="error", timeout=10)
+
+    def _run_tests(self) -> None:
+        path = Path(self.config.tests_path)
+        if not path.exists():
+            self.app.call_from_thread(self._set_status, f"[red]Путь не найден: {path}[/red]")
+            return
+
+        import_errors: list[DiscoveryError] = []
+        tests = discover_tests(path, errors=import_errors)
+        for err in import_errors:
+            self.app.call_from_thread(self.app.notify, f"Ошибка импорта: {err}", severity="error", timeout=10)
 
         if not tests:
             self.app.call_from_thread(self._set_status, "[yellow]Тесты не найдены[/yellow]")
@@ -351,9 +389,10 @@ class ResultsScreen(Screen):
             workers=self.config.workers,
             retries=self.config.retry,
             fail_fast=self.config.fail_fast,
+            trace=self.config.trace,
             on_result=on_result,
         )
-        _storage.save_run(self._run)
+        _get_storage().save_run(self._run)
 
         if self.config.html_report:
             generate_html_report(self._run, Path(self.config.html_report))
@@ -376,12 +415,16 @@ class ResultsScreen(Screen):
             f"{result.duration:.2f}s",
         )
         self.query_one("#progress", ProgressBar).advance(1)
-        run = self._run
-        if run:
-            self.query_one("#d-passed",  Digits).update(str(run.passed))
-            self.query_one("#d-failed",  Digits).update(str(run.failed))
-            self.query_one("#d-errored", Digits).update(str(run.errored))
-            self.query_one("#d-total",   Digits).update(str(run.total))
+        if result.status == TestStatus.PASSED:
+            self._passed += 1
+            self.query_one("#d-passed", Digits).update(str(self._passed))
+        elif result.status == TestStatus.FAILED:
+            self._failed += 1
+            self.query_one("#d-failed", Digits).update(str(self._failed))
+        elif result.status == TestStatus.ERROR:
+            self._errored += 1
+            self.query_one("#d-errored", Digits).update(str(self._errored))
+        self.query_one("#d-total", Digits).update(str(self._passed + self._failed + self._errored))
 
     def _finish(self) -> None:
         run = self._run
@@ -404,12 +447,13 @@ class ResultsScreen(Screen):
 # ─────────────────────────────────────────────────────────────
 
 class HistoryDetailScreen(Screen):
-    BINDINGS = [Binding("escape", "app.pop_screen", "Назад")]
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "app.pop_screen", "Назад")]
 
     def __init__(self, run_id: int) -> None:
         super().__init__()
         self.run_id = run_id
         self._results: list[TestResult] = []
+        self._run_data: dict | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -423,7 +467,7 @@ class HistoryDetailScreen(Screen):
                 id="stats-row",
             ),
             DataTable(id="detail-table"),
-            Static("[dim]Enter — открыть скриншот упавшего теста[/dim]", id="detail-hint"),
+            Static("[dim]Enter — открыть скриншот упавшего теста (trace: playwright show-trace <file>)[/dim]", id="detail-hint"),
             Horizontal(
                 Button("↓  Экспортировать", variant="primary", id="btn-export"),
                 classes="detail-btns",
@@ -433,8 +477,10 @@ class HistoryDetailScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        run = _storage.get_run(self.run_id)
-        results = _storage.get_run_results(self.run_id)
+        run = _get_storage().get_run(self.run_id)
+        results = _get_storage().get_run_results(self.run_id)
+        self._run_data = run
+        self._results = results
 
         if run:
             verdict = "PASSED" if run["failed"] == 0 and run["errored"] == 0 else "FAILED"
@@ -447,8 +493,6 @@ class HistoryDetailScreen(Screen):
             self.query_one("#dd-failed",  Digits).update(str(run["failed"]))
             self.query_one("#dd-errored", Digits).update(str(run["errored"]))
             self.query_one("#dd-total",   Digits).update(str(run["total"]))
-
-        self._results = results
 
         t = self.query_one("#detail-table", DataTable)
         t.add_columns("  Тест", "Статус", "Время", "Ошибка")
@@ -465,7 +509,6 @@ class HistoryDetailScreen(Screen):
 
     @on(DataTable.RowSelected, "#detail-table")
     def open_screenshot(self, event: DataTable.RowSelected) -> None:
-        import subprocess, sys
         idx = event.cursor_row
         if idx >= len(self._results):
             return
@@ -482,7 +525,6 @@ class HistoryDetailScreen(Screen):
         elif sys.platform.startswith("linux"):
             subprocess.Popen(["xdg-open", str(path)])
         else:
-            import os
             os.startfile(str(path))
         self.app.notify(f"Открываю: {path.name}")
 
@@ -492,9 +534,16 @@ class HistoryDetailScreen(Screen):
 
     @work(thread=True)
     def _do_export(self) -> None:
-        from datetime import datetime
-        run_data = _storage.get_run(self.run_id)
-        results  = _storage.get_run_results(self.run_id)
+        try:
+            self._export()
+        except Exception as exc:
+            self.app.call_from_thread(
+                self.app.notify, f"Ошибка экспорта: {type(exc).__name__}: {exc}", severity="error"
+            )
+
+    def _export(self) -> None:
+        run_data = self._run_data
+        results  = self._results
         if not run_data:
             self.app.call_from_thread(self.app.notify, "Прогон не найден", severity="error")
             return
@@ -548,7 +597,7 @@ class ConfirmModal(ModalScreen):
 
 
 class HistoryScreen(Screen):
-    BINDINGS = [Binding("escape", "app.pop_screen", "Назад")]
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "app.pop_screen", "Назад")]
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -571,7 +620,7 @@ class HistoryScreen(Screen):
         t.clear(columns=True)
         t.add_columns("ID", "Проект", "Дата", "Всего", "✓ Прошло", "✗ Упало", "Время")
         t.cursor_type = "row"
-        for r in _storage.list_runs(limit=30):
+        for r in _get_storage().list_runs(limit=30):
             ok    = r["failed"] == 0 and r["errored"] == 0
             color = "green" if ok else "red"
             t.add_row(
@@ -592,14 +641,14 @@ class HistoryScreen(Screen):
 
     @on(Button.Pressed, "#btn-clear-history")
     def btn_clear(self) -> None:
-        runs = _storage.list_runs(limit=10000)
+        runs = _get_storage().list_runs(limit=10000)
         if not runs:
             self.app.notify("История уже пуста", severity="warning")
             return
 
         def handle(confirmed: bool | None) -> None:
             if confirmed:
-                deleted = _storage.delete_runs()
+                deleted = _get_storage().delete_runs()
                 self._reload_table()
                 self.app.notify(f"Удалено прогонов: {deleted}", severity="information")
 
@@ -614,7 +663,7 @@ class HistoryScreen(Screen):
 # ─────────────────────────────────────────────────────────────
 
 class MainScreen(Screen):
-    BINDINGS = [Binding("q", "quit", "Выйти")]
+    BINDINGS: ClassVar[list[Binding]] = [Binding("q", "quit", "Выйти")]
 
     def __init__(self) -> None:
         super().__init__()
@@ -651,6 +700,7 @@ class MainScreen(Screen):
         flags = []
         if c.fail_fast: flags.append("[yellow]⚡ fail-fast[/yellow]")
         if c.headed:    flags.append("[cyan]👁  headed[/cyan]")
+        if c.trace:     flags.append("[magenta]🧭 trace[/magenta]")
         lines = [
             f"[dim]Тесты   [/dim] {c.tests_path}",
             f"[dim]URL     [/dim] {c.base_url or '[red]не задан[/red]'}",
@@ -703,7 +753,7 @@ class E2EApp(App):
 
     #logo {
         text-align: center;
-        color: $accent;
+        color: $success;
         text-style: bold;
         margin-bottom: 1;
     }
@@ -778,12 +828,13 @@ class E2EApp(App):
 
     .fields-row Vertical {
         width: 1fr;
+        height: auto;
         margin-right: 1;
     }
 
     .switches-row {
         height: auto;
-        margin-top: 1;
+        margin-top: 0;
     }
 
     .switch-card {
