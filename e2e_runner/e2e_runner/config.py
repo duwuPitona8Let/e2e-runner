@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -21,24 +22,46 @@ DEFAULTS: dict[str, Any] = {
     "json_report": "",
 }
 
-CONFIG_TEMPLATE = """\
-# e2e runner configuration
-# CLI flags always override values in this file.
+# key -> comment, in file order; None marks a blank line between groups.
+_LAYOUT: list[tuple[str, str] | None] = [
+    ("project", "project name saved in history"),
+    ("base_url", "URL of the app under test, e.g. http://localhost:8080"),
+    ("tests", "path to tests directory or file"),
+    None,
+    ("workers", "parallel workers (1 = sequential)"),
+    ("timeout", "browser action timeout in ms"),
+    ("retry", "retry failed tests N times"),
+    ("fail_fast", "stop on first failure"),
+    ("headed", "show browser window during tests"),
+    ("trace", "save Playwright trace (.zip) for failed tests"),
+    None,
+    ("html_report", "path to save HTML report (empty = skip)"),
+    ("json_report", "path to save JSON report (empty = skip)"),
+]
 
-project: default        # project name saved in history
-base_url: ""            # URL of the app under test, e.g. http://localhost:8080
-tests: .                # path to tests directory or file
 
-workers: 1              # parallel workers (1 = sequential)
-timeout: 30000          # browser action timeout in ms
-retry: 0                # retry failed tests N times
-fail_fast: false        # stop on first failure
-headed: false           # show browser window during tests
-trace: false            # save Playwright trace (.zip) for failed tests
+def _yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)  # a JSON string is a valid YAML scalar
 
-html_report: ""         # path to save HTML report (empty = skip)
-json_report: ""         # path to save JSON report (empty = skip)
-"""
+
+def render_config(values: dict[str, Any]) -> str:
+    """e2e.yaml text with comments for the given values (missing keys use DEFAULTS)."""
+    lines = ["# e2e runner configuration", "# CLI flags always override values in this file.", ""]
+    for entry in _LAYOUT:
+        if entry is None:
+            lines.append("")
+            continue
+        key, comment = entry
+        field = f"{key}: {_yaml_scalar(values.get(key, DEFAULTS[key]))}"
+        lines.append(f"{field:<36} # {comment}")
+    return "\n".join(lines) + "\n"
+
+
+CONFIG_TEMPLATE = render_config(DEFAULTS)
 
 
 class ConfigError(Exception):

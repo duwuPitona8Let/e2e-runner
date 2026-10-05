@@ -35,13 +35,15 @@ def _run_codegen(url: str) -> str:
         out = Path(tmp) / "recorded.py"
         cmd = [sys.executable, "-m", "playwright", "codegen", "--target", "python-pytest", "-o", str(out), url]
         try:
-            proc = subprocess.run(cmd, check=False)
+            # Output is captured so codegen's messages don't draw over the TUI.
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
         except OSError as exc:
             raise RecordError(f"could not start playwright codegen: {exc}") from exc
         if not out.exists():
+            details = "\n".join((proc.stderr or proc.stdout or "").strip().splitlines()[-3:])
             raise RecordError(
                 f"playwright codegen exited with code {proc.returncode} without saving a recording "
-                "(is Chromium installed? run: playwright install chromium)"
+                "(is Chromium installed? run: playwright install chromium)" + (f"\n{details}" if details else "")
             )
         return out.read_text(encoding="utf-8")
 

@@ -25,6 +25,8 @@ from textual.widgets import (
     Switch,
 )
 
+from . import recorder
+from .config import CONFIG_FILENAME, DEFAULTS, ConfigError, find_config, load_config, render_config
 from .discovery import DiscoveryError, discover_tests
 from .models import TestResult, TestRun, TestStatus
 from .reporter import generate_html_report, generate_json_report
@@ -59,17 +61,64 @@ STATUS_STYLE = {
 
 
 class Config:
-    def __init__(self) -> None:
-        self.tests_path  = "."
-        self.base_url    = ""
-        self.workers     = 1
-        self.timeout     = 30000
-        self.retry       = 0
-        self.fail_fast   = False
-        self.headed      = False
-        self.trace       = False
-        self.html_report = ""
-        self.json_report = ""
+    """Run settings edited in the TUI. Mirrors e2e.yaml; only tests_path is named differently."""
+
+    _YAML_KEYS: ClassVar[dict[str, str]] = {
+        "project": "project",
+        "tests_path": "tests",
+        "base_url": "base_url",
+        "workers": "workers",
+        "timeout": "timeout",
+        "retry": "retry",
+        "fail_fast": "fail_fast",
+        "headed": "headed",
+        "trace": "trace",
+        "html_report": "html_report",
+        "json_report": "json_report",
+    }
+
+    def __init__(self, values: dict | None = None, source: Path | None = None) -> None:
+        merged = {**DEFAULTS, **(values or {})}
+        self.project: str = merged["project"]
+        self.tests_path: str = merged["tests"]
+        self.base_url: str = merged["base_url"]
+        self.workers: int = merged["workers"]
+        self.timeout: int = merged["timeout"]
+        self.retry: int = merged["retry"]
+        self.fail_fast: bool = merged["fail_fast"]
+        self.headed: bool = merged["headed"]
+        self.trace: bool = merged["trace"]
+        self.html_report: str = merged["html_report"]
+        self.json_report: str = merged["json_report"]
+        self.source = source  # e2e.yaml these values came from / will be saved to
+
+    def to_yaml_values(self) -> dict:
+        return {key: getattr(self, attr) for attr, key in self._YAML_KEYS.items()}
+
+
+def _effective_base_url(config: Config) -> str:
+    """Base URL from settings, else from the registered project (same rule as `e2e run`)."""
+    if config.base_url:
+        return config.base_url
+    project = _get_storage().get_project(config.project) if config.project else None
+    return project.base_url if project else ""
+
+
+def _open_path(path: Path) -> None:
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    elif sys.platform.startswith("linux"):
+        subprocess.Popen(["xdg-open", str(path)])
+    else:
+        os.startfile(str(path))
+
+
+def _open_trace(path: Path) -> None:
+    subprocess.Popen(
+        [sys.executable, "-m", "playwright", "show-trace", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -167,6 +216,11 @@ class SettingsScreen(Screen):
             Static("⚙  Настройки запуска", id="settings-title"),
             Static("", id="settings-error"),
 
+            Static("Проект", classes="field-label"),
+            Input(value=self.config.project, id="project", placeholder="default"),
+            Static("Под этим именем прогоны сохраняются в историю; URL берётся из проекта, если Base URL пуст",
+                   classes="field-hint"),
+
             Static("Путь к тестам", classes="field-label"),
             Horizontal(
                 Input(value=self.config.tests_path, id="tests_path", placeholder="tests/"),
@@ -230,6 +284,7 @@ class SettingsScreen(Screen):
 
             Horizontal(
                 Button("  Сохранить", variant="success", id="save"),
+                Button("💾 Сохранить в e2e.yaml", variant="primary", id="save-yaml"),
                 Button("  Отмена",   id="cancel"),
                 classes="form-btns",
             ),
@@ -255,15 +310,39 @@ class SettingsScreen(Screen):
 
     @on(Button.Pressed, "#save")
     def save(self) -> None:
+        if self._apply():
+            self.app.pop_screen()
+
+    @on(Button.Pressed, "#save-yaml")
+    def save_yaml(self) -> None:
+        if not self._apply():
+            return
+        path = self.config.source or Path.cwd() / CONFIG_FILENAME
+        try:
+            path.write_text(render_config(self.config.to_yaml_values()), encoding="utf-8")
+        except OSError as exc:
+            self._show_error(f"Не удалось записать {path}: {exc}")
+            return
+        self.config.source = path
+        self.app.notify(f"Сохранено в {path}")
+        self.app.pop_screen()
+
+    def _apply(self) -> bool:
+        """Validate the form and copy it into the config. Returns False (and shows why) on bad input."""
         def val(id_: str) -> str:
             return self.query_one(f"#{id_}", Input).value.strip()
 
         self._clear_error()
 
+        project = val("project") or "default"
+        if len(project) > 64:
+            self._show_error("Проект: не длиннее 64 символов")
+            return False
+
         base_url = val("base_url")
         if base_url and not base_url.startswith(("http://", "https://")):
             self._show_error("Base URL должен начинаться с http:// или https://")
-            return
+            return False
 
         try:
             workers = int(val("workers") or "1")
@@ -271,7 +350,7 @@ class SettingsScreen(Screen):
                 raise ValueError
         except ValueError:
             self._show_error("Параллельные потоки: введите целое число от 1 до 32")
-            return
+            return False
 
         try:
             timeout = int(val("timeout") or "30000")
@@ -279,7 +358,7 @@ class SettingsScreen(Screen):
                 raise ValueError
         except ValueError:
             self._show_error("Таймаут: введите число от 1000 до 300000 мс")
-            return
+            return False
 
         try:
             retry = int(val("retry") or "0")
@@ -287,8 +366,9 @@ class SettingsScreen(Screen):
                 raise ValueError
         except ValueError:
             self._show_error("Retry: введите целое число от 0 до 10")
-            return
+            return False
 
+        self.config.project     = project
         self.config.tests_path  = val("tests_path") or "."
         self.config.base_url    = base_url
         self.config.html_report = val("html_report")
@@ -299,7 +379,7 @@ class SettingsScreen(Screen):
         self.config.fail_fast   = self.query_one("#fail_fast", Switch).value
         self.config.headed      = self.query_one("#headed",    Switch).value
         self.config.trace       = self.query_one("#trace",     Switch).value
-        self.app.pop_screen()
+        return True
 
     @on(Button.Pressed, "#cancel")
     def cancel(self) -> None:
@@ -382,8 +462,8 @@ class ResultsScreen(Screen):
 
         self._run = run_suite(
             tests=tests,
-            project_name="tui",
-            base_url=self.config.base_url,
+            project_name=self.config.project or "default",
+            base_url=_effective_base_url(self.config),
             headless=not self.config.headed,
             timeout=self.config.timeout,
             workers=self.config.workers,
@@ -447,7 +527,11 @@ class ResultsScreen(Screen):
 # ─────────────────────────────────────────────────────────────
 
 class HistoryDetailScreen(Screen):
-    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "app.pop_screen", "Назад")]
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "app.pop_screen", "Назад"),
+        Binding("t", "open_trace", "Trace"),
+        Binding("s", "open_screenshot", "Скриншот"),
+    ]
 
     def __init__(self, run_id: int) -> None:
         super().__init__()
@@ -467,7 +551,10 @@ class HistoryDetailScreen(Screen):
                 id="stats-row",
             ),
             DataTable(id="detail-table"),
-            Static("[dim]Enter — открыть скриншот упавшего теста (trace: playwright show-trace <file>)[/dim]", id="detail-hint"),
+            Static(
+                "[dim]Enter — открыть trace (если есть) или скриншот · t — trace · s — скриншот[/dim]",
+                id="detail-hint",
+            ),
             Horizontal(
                 Button("↓  Экспортировать", variant="primary", id="btn-export"),
                 classes="detail-btns",
@@ -495,7 +582,7 @@ class HistoryDetailScreen(Screen):
             self.query_one("#dd-total",   Digits).update(str(run["total"]))
 
         t = self.query_one("#detail-table", DataTable)
-        t.add_columns("  Тест", "Статус", "Время", "Ошибка")
+        t.add_columns("  Тест", "Статус", "Время", "Артефакты", "Ошибка")
         t.cursor_type = "row"
         for r in results:
             label, color = STATUS_STYLE[r.status]
@@ -504,28 +591,42 @@ class HistoryDetailScreen(Screen):
                 r.test_case.name,
                 f"[{color}]{label}[/{color}]",
                 f"{r.duration:.2f}s",
+                " ".join(icon for icon, path in (("🧭", r.trace_path), ("📷", r.screenshot_path)) if path),
                 f"[dim]{error}[/dim]" if error else "",
             )
 
     @on(DataTable.RowSelected, "#detail-table")
-    def open_screenshot(self, event: DataTable.RowSelected) -> None:
-        idx = event.cursor_row
-        if idx >= len(self._results):
+    def open_artifact(self, event: DataTable.RowSelected) -> None:
+        result = self._result_at(event.cursor_row)
+        if result is None:
             return
-        result = self._results[idx]
-        if not result.screenshot_path:
-            self.app.notify("Скриншот недоступен для этого теста", severity="warning")
+        if result.trace_path:
+            self._open(result.trace_path, "Trace", _open_trace)
+        else:
+            self._open(result.screenshot_path, "Скриншот", _open_path)
+
+    def action_open_trace(self) -> None:
+        result = self._result_at(self.query_one("#detail-table", DataTable).cursor_row)
+        if result is not None:
+            self._open(result.trace_path, "Trace", _open_trace)
+
+    def action_open_screenshot(self) -> None:
+        result = self._result_at(self.query_one("#detail-table", DataTable).cursor_row)
+        if result is not None:
+            self._open(result.screenshot_path, "Скриншот", _open_path)
+
+    def _result_at(self, index: int) -> TestResult | None:
+        return self._results[index] if 0 <= index < len(self._results) else None
+
+    def _open(self, path_str: str | None, what: str, opener) -> None:
+        if not path_str:
+            self.app.notify(f"{what} недоступен для этого теста", severity="warning")
             return
-        path = Path(result.screenshot_path)
+        path = Path(path_str)
         if not path.exists():
             self.app.notify(f"Файл не найден: {path}", severity="error")
             return
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
-        elif sys.platform.startswith("linux"):
-            subprocess.Popen(["xdg-open", str(path)])
-        else:
-            os.startfile(str(path))
+        opener(path)
         self.app.notify(f"Открываю: {path.name}")
 
     @on(Button.Pressed, "#btn-export")
@@ -564,6 +665,62 @@ class HistoryDetailScreen(Screen):
             severity="information",
             timeout=6,
         )
+
+
+# ─────────────────────────────────────────────────────────────
+#  Record modal
+# ─────────────────────────────────────────────────────────────
+
+class RecordModal(ModalScreen):
+    """Ask where to record a test from and where to save it; dismisses with (url, output, name) or None."""
+
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "cancel", "Отмена")]
+
+    def __init__(self, url: str, output: str) -> None:
+        super().__init__()
+        self._url = url
+        self._output = output
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Static("⏺  Записать тест", id="record-title"),
+            Static("", id="record-error"),
+            Static("Адрес, с которого начать", classes="field-label"),
+            Input(value=self._url, id="record-url", placeholder="http://localhost:8080"),
+            Static("Файл теста (создать или дописать)", classes="field-label"),
+            Input(value=self._output, id="record-output", placeholder="tests/test_recorded.py"),
+            Static("Имя теста (необязательно)", classes="field-label"),
+            Input(value="", id="record-name", placeholder="по имени файла, например test_login"),
+            Static(
+                "[dim]Откроется браузер: пройдите сценарий и закройте окно — шаги сохранятся в файл.[/dim]",
+                id="record-hint",
+            ),
+            Horizontal(
+                Button("⏺  Записать", variant="success", id="record-ok"),
+                Button("Отмена", variant="default", id="record-cancel"),
+                classes="modal-btns",
+            ),
+            id="record-box",
+        )
+
+    @on(Button.Pressed, "#record-ok")
+    def ok(self) -> None:
+        url = self.query_one("#record-url", Input).value.strip()
+        output = self.query_one("#record-output", Input).value.strip()
+        name = self.query_one("#record-name", Input).value.strip()
+        error = self.query_one("#record-error", Static)
+        if not url.startswith(("http://", "https://")):
+            error.update("[bold red]✗  Адрес должен начинаться с http:// или https://[/bold red]")
+        elif not output.endswith(".py"):
+            error.update("[bold red]✗  Файл теста должен заканчиваться на .py[/bold red]")
+        elif name and not (name.isidentifier() and name.startswith("test_")):
+            error.update("[bold red]✗  Имя теста: идентификатор, начинающийся с test_[/bold red]")
+        else:
+            self.dismiss((url, output, name or None))
+
+    @on(Button.Pressed, "#record-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -668,6 +825,13 @@ class MainScreen(Screen):
     def __init__(self) -> None:
         super().__init__()
         self.config = Config()
+        self._config_error: str | None = None
+        path = find_config()
+        if path:
+            try:
+                self.config = Config(load_config(path), source=path)
+            except ConfigError as exc:
+                self._config_error = str(exc)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -681,6 +845,7 @@ class MainScreen(Screen):
                 Vertical(
                     Button("▶   Запустить тесты", variant="success", id="btn-run"),
                     Button("⚙   Настройки",        variant="primary",  id="btn-settings"),
+                    Button("⏺   Записать тест",    variant="default",  id="btn-record"),
                     Button("    История",           variant="default",  id="btn-history"),
                     Button("✕   Выйти",             variant="error",    id="btn-quit"),
                     id="menu",
@@ -694,6 +859,13 @@ class MainScreen(Screen):
     def on_mount(self) -> None:
         self.query_one("#summary-card").border_title = " Конфигурация "
         self.query_one("#menu").border_title = " Действия "
+        if self._config_error:
+            self.app.notify(
+                f"{self._config_error}\nИспользуются настройки по умолчанию.",
+                title="Ошибка в e2e.yaml",
+                severity="error",
+                timeout=12,
+            )
 
     def _summary(self) -> str:
         c = self.config
@@ -704,7 +876,10 @@ class MainScreen(Screen):
             flags.append("[cyan]👁  headed[/cyan]")
         if c.trace:
             flags.append("[magenta]🧭 trace[/magenta]")
+        source = c.source.name if c.source else "[dim]нет — по умолчанию[/dim]"
         lines = [
+            f"[dim]Конфиг  [/dim] {source}",
+            f"[dim]Проект  [/dim] {c.project}",
             f"[dim]Тесты   [/dim] {c.tests_path}",
             f"[dim]URL     [/dim] {c.base_url or '[red]не задан[/red]'}",
             f"[dim]Потоки  [/dim] {c.workers}   [dim]Retry[/dim]  {c.retry}",
@@ -717,7 +892,7 @@ class MainScreen(Screen):
 
     @on(Button.Pressed, "#btn-run")
     def btn_run(self) -> None:
-        if not self.config.base_url:
+        if not _effective_base_url(self.config):
             def handle(confirmed: bool | None) -> None:
                 if confirmed:
                     self.app.push_screen(ResultsScreen(self.config))
@@ -725,10 +900,39 @@ class MainScreen(Screen):
         else:
             self.app.push_screen(ResultsScreen(self.config))
 
-    @on(Button.Pressed, "#btn-settings")
-    async def btn_settings(self) -> None:
-        await self.app.push_screen(SettingsScreen(self.config))
+    def on_screen_resume(self) -> None:
+        # Back from Settings (or any other screen): show the possibly changed config.
         self._refresh()
+
+    @on(Button.Pressed, "#btn-settings")
+    def btn_settings(self) -> None:
+        self.app.push_screen(SettingsScreen(self.config))
+
+    @on(Button.Pressed, "#btn-record")
+    def btn_record(self) -> None:
+        tests = Path(self.config.tests_path)
+        folder = tests.parent if tests.suffix == ".py" else tests
+        default_output = str(folder / "test_recorded.py")
+
+        def handle(answer: tuple[str, str, str | None] | None) -> None:
+            if answer:
+                self.app.notify("Браузер открыт: пройдите сценарий и закройте окно.", timeout=8)
+                self._record(*answer)
+
+        self.app.push_screen(RecordModal(_effective_base_url(self.config), default_output), handle)
+
+    @work(thread=True)
+    def _record(self, url: str, output: str, name: str | None) -> None:
+        try:
+            test_name, path = recorder.record(url, Path(output), name)
+        except Exception as exc:
+            self.app.call_from_thread(
+                self.app.notify, f"Запись не удалась: {exc}", severity="error", timeout=12
+            )
+            return
+        self.app.call_from_thread(
+            self.app.notify, f"Сохранён {test_name}() → {path}", title="Тест записан", timeout=10
+        )
 
     @on(Button.Pressed, "#btn-history")
     def btn_history(self) -> None:
@@ -967,6 +1171,28 @@ class E2EApp(App):
     }
 
     .modal-btns Button { margin-right: 1; }
+
+    /* ── Record modal ── */
+    RecordModal {
+        align: center middle;
+    }
+
+    #record-box {
+        border: round $primary;
+        background: $surface;
+        padding: 1 3;
+        width: 72;
+        height: auto;
+    }
+
+    #record-title {
+        text-style: bold;
+        color: $accent;
+        text-align: center;
+    }
+
+    #record-error { min-height: 1; text-align: center; }
+    #record-hint { margin: 1 0; }
 
     /* ── File browser modal ── */
     FileBrowserModal {

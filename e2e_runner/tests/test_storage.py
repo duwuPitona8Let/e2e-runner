@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -104,6 +105,7 @@ def test_migrates_old_db_without_trace_path(tmp_path: Path) -> None:
     storage = Storage(db_path=db)
     Storage(db_path=db)  # a second init must not fail on the now-existing column
 
-    columns = [row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(test_results)")]
+    with closing(sqlite3.connect(db)) as check:
+        columns = [row[1] for row in check.execute("PRAGMA table_info(test_results)")]
     assert "trace_path" in columns
     assert storage.save_run(_run()).id is not None
