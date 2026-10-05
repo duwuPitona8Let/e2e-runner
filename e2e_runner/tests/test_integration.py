@@ -36,5 +36,5 @@ def test_demo_suite_has_expected_results(workers: int) -> None:
     run = run_suite(tests, project_name="integration", base_url=DEMO_URL, workers=workers)
 
     failed = sorted(r.test_case.function_name for r in run.results if r.status.value != "passed")
-    assert (run.total, run.passed) == (25, 22)
+    assert (run.total, run.passed) == (26, 23)
     assert failed == ["test_login_as_unknown_user", "test_nonexistent_item", "test_wrong_title"]

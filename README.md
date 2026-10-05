@@ -336,7 +336,7 @@ python3 app.py          # http://localhost:8080
 e2e run demo_app/tests -u http://localhost:8080
 ```
 
-Демо-приложение содержит 25 тестов: 22 проходят, 3 намеренно падают — для демонстрации `--retry` и `--fail-fast`. Тесты в `test_account.py` используют общий логин из `conftest.py` (см. [Фикстуры](#фикстуры)).
+Демо-приложение содержит 26 тестов: 23 проходят, 3 намеренно падают — для демонстрации `--retry` и `--fail-fast`. Тесты в `test_account.py` используют общий логин из `conftest.py` (см. [Фикстуры](#фикстуры)).
 
 Учётные данные: `admin / password123`, `user / qwerty`.
 
@@ -366,5 +366,6 @@ demo_app/
 └── tests/
     ├── conftest.py      # общий логин auth_admin
     ├── test_account.py  # тесты залогиненного пользователя (use_auth = "admin")
+    ├── test_recorded.py # тест, записанный через e2e record (+ проверка, добавленная вручную)
     └── test_demo_app.py
 ```
