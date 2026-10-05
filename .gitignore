@@ -14,3 +14,7 @@ screenshots/
 report.html
 report.json
 .claude/settings.local.json
+
+# Generated test reports
+report*.html
+report*.json
