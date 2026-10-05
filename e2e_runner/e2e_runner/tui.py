@@ -698,9 +698,12 @@ class MainScreen(Screen):
     def _summary(self) -> str:
         c = self.config
         flags = []
-        if c.fail_fast: flags.append("[yellow]⚡ fail-fast[/yellow]")
-        if c.headed:    flags.append("[cyan]👁  headed[/cyan]")
-        if c.trace:     flags.append("[magenta]🧭 trace[/magenta]")
+        if c.fail_fast:
+            flags.append("[yellow]⚡ fail-fast[/yellow]")
+        if c.headed:
+            flags.append("[cyan]👁  headed[/cyan]")
+        if c.trace:
+            flags.append("[magenta]🧭 trace[/magenta]")
         lines = [
             f"[dim]Тесты   [/dim] {c.tests_path}",
             f"[dim]URL     [/dim] {c.base_url or '[red]не задан[/red]'}",
