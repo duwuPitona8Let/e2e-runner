@@ -14,6 +14,8 @@ from .config import (
 )
 from .discovery import DiscoveryError, discover_tests
 from .models import Project, TestResult, TestRun
+from .recorder import RecordError
+from .recorder import record as record_session
 from .reporter import (
     console,
     generate_html_report,
@@ -83,6 +85,7 @@ def _print_discovery_errors(errors: list[DiscoveryError]) -> None:
     "  e2e run                               # run using e2e.yaml\n"
     "  e2e run tests/ -u http://localhost:8080\n"
     "  e2e run tests/ -u URL -n 4 --retry 2 --fail-fast --html report.html\n"
+    "  e2e record http://localhost:8080 -o tests/test_login.py\n"
     "  e2e export RUN_ID [--format html|json|all] [--open]\n"
     "  e2e clean [--keep N] [-p PROJECT] [-y]\n"
     "  e2e history [-p PROJECT] [-n LIMIT]\n"
@@ -224,6 +227,56 @@ def init(force: bool) -> None:
     dest.write_text(CONFIG_TEMPLATE)
     console.print(f"[green]Created:[/green] {dest}")
     console.print("[dim]Edit the file, then run [bold]e2e run[/bold] — flags in e2e.yaml are picked up automatically.[/dim]")
+
+
+# ──────────────────────────────────────────────
+#  record
+# ──────────────────────────────────────────────
+
+@main.command()
+@click.argument("url", required=False)
+@click.option("-o", "--output", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Test file to create or append to (default: <tests>/test_recorded.py)")
+@click.option("-n", "--name", default=None, help="Test function name (default: from file name)")
+@click.option("-p", "--project", default=None, help="Take URL from this project if URL is omitted")
+def record(url: str | None, output: Path | None, name: str | None, project: str | None) -> None:
+    """Record a test by clicking through URL in a browser (playwright codegen).
+
+    Close the browser window to finish; the recorded steps are saved as a
+    test_* function. URLs are made relative, so run it with `e2e run -u URL`.
+    """
+    cfg: dict = {}
+    cfg_path = find_config()
+    if cfg_path:
+        try:
+            cfg = load_config(cfg_path)
+        except ConfigError as exc:
+            console.print(f"[red]Config error:[/red] {exc}")
+            raise SystemExit(1) from None
+
+    if not url and project:
+        project_obj = _get_storage().get_project(project)
+        url = project_obj.base_url if project_obj else None
+    url = url or cfg.get("base_url") or None
+    if not url:
+        console.print("[red]No URL: pass it as an argument, set base_url in e2e.yaml, or use -p PROJECT.[/red]")
+        raise SystemExit(1)
+    _validate_url(url)
+
+    if output is None:
+        tests_dir = Path(cfg.get("tests", "tests"))
+        output = (tests_dir if tests_dir.suffix != ".py" else tests_dir.parent) / "test_recorded.py"
+
+    console.print(f"[bold]Recording[/bold] {url} → [cyan]{output}[/cyan]")
+    console.print("[dim]Click through the scenario in the browser, then close the browser window to save.[/dim]")
+    try:
+        test_name, path = record_session(url, output, name)
+    except RecordError as exc:
+        console.print(f"[red]Recording failed:[/red] {exc}")
+        raise SystemExit(1) from None
+
+    console.print(f"[green]Saved[/green] {test_name}() → {path}")
+    console.print(f"[dim]Run it: e2e run {path} -u {url} -k {test_name}[/dim]")
 
 
 # ──────────────────────────────────────────────
