@@ -1,4 +1,4 @@
-"""Check `e2e run` against demo_app: exit code 1 with exactly 19 passed / 3 intentional failures.
+"""Check `e2e run` against demo_app: exit code 1 with exactly 22 passed / 3 intentional failures.
 
 Usage: check_e2e_report.py REPORT_JSON EXIT_CODE
 Prints a Markdown summary to stdout (CI appends it to the job summary); exits 1 on mismatch.
@@ -6,7 +6,7 @@ Prints a Markdown summary to stdout (CI appends it to the job summary); exits 1 
 import json
 import sys
 
-EXPECTED = {"passed": 19, "failed": 3, "errored": 0, "total": 22}
+EXPECTED = {"passed": 22, "failed": 3, "errored": 0, "total": 25}
 EXPECTED_EXIT_CODE = 1  # the 3 failing demo tests are intentional
 
 
