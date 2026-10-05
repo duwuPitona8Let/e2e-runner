@@ -18,3 +18,6 @@ report.json
 # Generated test reports
 report*.html
 report*.json
+.venv/
+.coverage
+htmlcov/

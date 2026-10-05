@@ -20,3 +20,10 @@ e2e = "e2e_runner.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: real-browser tests against demo_app (skipped unless it runs on :8080)"]
