@@ -1,5 +1,7 @@
 # e2e_runner
 
+[![CI](https://github.com/duwuPitona8Let/e2e-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/duwuPitona8Let/e2e-runner/actions/workflows/ci.yml)
+
 Инструмент командной строки для автоматизированного E2E-тестирования веб-приложений. Написан на Python, использует Playwright для управления браузером.
 
 ---

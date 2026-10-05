@@ -43,7 +43,7 @@ def discover_tests(
 def _collect_from_module(module: ModuleType, file: Path, filter_pattern: str) -> list[TestCase]:
 
     tests: list[TestCase] = []
-    for name, obj in inspect.getmembers(module, inspect.isfunction):
+    for name, _ in inspect.getmembers(module, inspect.isfunction):
         if not name.startswith("test_"):
             continue
         if filter_pattern and filter_pattern.lower() not in name.lower():
