@@ -24,7 +24,8 @@
 - Автоматическое обнаружение тестов по шаблону `test_*.py`
 - Параллельный запуск тестов (`--workers N`)
 - Повтор упавших тестов (`--retry N`)
-- Скриншоты при падении теста
+- Запись тестов в браузере без написания кода (`e2e record`)
+- Скриншоты и Playwright trace при падении теста
 - История прогонов в SQLite
 - Отчёты в форматах HTML и JSON
 - Конфигурация через файл `e2e.yaml`
@@ -133,6 +134,33 @@ e2e run tests/ --fail-fast --html report.html
 ```bash
 e2e init          # создать e2e.yaml в текущей папке
 e2e init --force  # перезаписать существующий
+```
+
+---
+
+### `e2e record` — записать тест в браузере
+
+Открывает браузер с инспектором Playwright (`playwright codegen`). Пройдите сценарий мышкой и закройте окно браузера — шаги сохранятся как функция `test_*`. Адреса делаются относительными, поэтому тест работает с любым `-u`.
+
+```bash
+e2e record http://localhost:8080 -o tests/test_login.py   # создать файл
+e2e record http://localhost:8080 -o tests/test_login.py   # дописать ещё один тест (test_login_2)
+e2e record -o tests/test_cart.py -n test_add_to_cart      # URL из e2e.yaml, своё имя теста
+e2e record -p shop                                         # URL из зарегистрированного проекта
+```
+
+Получившийся файл:
+
+```python
+from playwright.sync_api import Page, expect
+
+
+def test_login(page: Page) -> None:
+    page.goto("/login")
+    page.locator("#username").fill("admin")
+    page.locator("#password").fill("password123")
+    page.get_by_role("button", name="Войти").click()
+    expect(page.locator("h1")).to_contain_text("Личный кабинет")
 ```
 
 ---
@@ -281,11 +309,13 @@ e2e_runner/
 │   ├── cli.py          # точка входа, Click-команды
 │   ├── discovery.py    # поиск и загрузка тестов
 │   ├── runner.py       # выполнение тестов через Playwright
+│   ├── recorder.py     # e2e record: запись тестов через playwright codegen
 │   ├── reporter.py     # вывод в терминал, HTML/JSON отчёты
 │   ├── storage.py      # SQLite хранилище истории
 │   ├── tui.py          # TUI-интерфейс на Textual
 │   ├── config.py       # чтение e2e.yaml
 │   └── models.py       # модели данных
+├── tests/              # unit- и интеграционные тесты самого инструмента
 └── pyproject.toml
 
 demo_app/
